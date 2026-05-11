@@ -21,6 +21,22 @@ pip install packr
   throttles saturated layers while keeping hungry layers at full learning rate
 - **Drop-in replacement** — `compress_model(model)` converts any HuggingFace model
 
+## How It Works
+
+PackR decomposes a weight matrix into three components:
+
+- **W_p** (uint8, 1 byte/weight, frozen): Byte indices into a 256-entry codebook
+- **W_f** (bfloat16, 2 bytes/weight, trainable): Floating-point residual
+- **lut** (float32, 256 entries, trainable): Learnable codebook
+
+Forward pass: `out = x @ (W_f + lut[W_p]) + bias`
+
+| Representation | Persistent VRAM per weight |
+|---------------|:-------------------------:|
+| Standard fp32 | 4 bytes |
+| Standard fp16 | 2 bytes |
+| PackR | 3 bytes |
+
 ## Quick Start
 
 ```python
@@ -113,22 +129,6 @@ config = PackRConfig(offload=True)
 model = compress_model(model, config)
 # Training loop unchanged — offloading is transparent
 ```
-
-## How It Works
-
-PackR decomposes a weight matrix into three components:
-
-- **W_p** (uint8, 1 byte/weight, frozen): Byte indices into a 256-entry codebook
-- **W_f** (bfloat16, 2 bytes/weight, trainable): Floating-point residual
-- **lut** (float32, 256 entries, trainable): Learnable codebook
-
-Forward pass: `out = x @ (W_f + lut[W_p]) + bias`
-
-| Representation | Persistent VRAM per weight |
-|---------------|:-------------------------:|
-| Standard fp32 | 4 bytes |
-| Standard fp16 | 2 bytes |
-| PackR | 3 bytes |
 
 ## Requirements
 
