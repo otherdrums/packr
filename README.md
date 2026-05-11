@@ -2,7 +2,7 @@
 
 Drop-in `nn.Linear` replacement that stores weights as uint8 bytecode indices
 into a trainable 256-entry lookup table plus bfloat16 residual deltas —
-3 bytes/weight, 37% less GPU memory, identical accuracy.
+3 bytes/weight, 37% less GPU memory, accuracy within 0.1% of full fine-tune.
 
 ```bash
 pip install packr
