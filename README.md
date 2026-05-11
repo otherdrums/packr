@@ -1,7 +1,8 @@
-# PackR — Packed Residual
+# PackR — Compressed neural network weights with learnable codebooks
 
-Memory-efficient `nn.Linear` drop-in replacement with packed uint8 codebook
-indices, bfloat16 residuals, and a 256-entry learnable lookup table.
+Drop-in `nn.Linear` replacement that stores weights as uint8 bytecode indices
+into a trainable 256-entry lookup table plus bfloat16 residual deltas —
+3 bytes/weight, 37% less GPU memory, identical accuracy.
 
 ```bash
 pip install packr
