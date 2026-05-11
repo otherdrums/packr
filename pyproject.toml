@@ -31,6 +31,10 @@ dependencies = [
 dev = [
     "transformers",
     "datasets",
+    "pytest>=7.0",
+]
+zpackr = [
+    "zstandard>=0.22",
 ]
 
 [tool.setuptools.packages.find]

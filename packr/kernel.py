@@ -1,17 +1,46 @@
 """
-PackR fused decode kernel (CUDA) + matmul (cuBLAS via torch).
+PackR fused decode kernel + matmul (cuBLAS via torch).
 
-Drops Triton in favor of hand-tuned cuBLAS matmul (~3× faster on
-CUDA-core-only GPUs like GTX 1650).  The decode step is a trivial
-CUDA LUT-lookup kernel injected at import time via load_inline.
+Two decode backends:
+  - Triton (preferred): AOT-compiled cubin loaded at init time.  No nvcc needed.
+  - CUDA JIT (fallback):  load_inline compiles at first use.  Requires nvcc.
+  - Pure PyTorch (final):  lut[W_p.long()].  Correct but materializes full tensor.
 """
 
 import torch
-from torch.utils.cpp_extension import load_inline
 
 # ---------------------------------------------------------------------------
-# JIT-compile the CUDA decode kernel (trivial LUT lookup, ~0.2ms for 2M els)
+# Triton decode kernel — AOT-compiled to cubin for release builds.
+# Lives alongside the CUDA source for JIT fallback.
 # ---------------------------------------------------------------------------
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _decode_packed_triton(
+        W_p_ptr,       # uint8* device pointer
+        lut_ptr,       # float16* device pointer
+        out_ptr,       # float16* device pointer
+        N,             # int32 num_elements
+        BLOCK: tl.constexpr,
+    ):
+        idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = idx < N
+        w_p = tl.load(W_p_ptr + idx, mask=mask).to(tl.int32)
+        decoded = tl.load(lut_ptr + w_p, mask=mask)
+        tl.store(out_ptr + idx, decoded, mask=mask)
+
+    _HAS_TRITON = True
+except ImportError:
+    _decode_packed_triton = None
+    _HAS_TRITON = False
+
+# ---------------------------------------------------------------------------
+# CUDA JIT source — kept for fallback when precompiled cubins unavailable.
+# ---------------------------------------------------------------------------
+
 _cuda_source = """
 #include <torch/extension.h>
 #include <cuda_fp16.h>
@@ -46,25 +75,34 @@ torch::Tensor decode_packed_cuda(torch::Tensor W_p, torch::Tensor lut) {
 
 _cpp_source = "torch::Tensor decode_packed_cuda(torch::Tensor W_p, torch::Tensor lut);"
 
-_decode_ext = load_inline(
-    name="packr_decode_ext",
-    cpp_sources=_cpp_source,
-    cuda_sources=_cuda_source,
-    functions=["decode_packed_cuda"],
-    with_cuda=True,
-    extra_cuda_cflags=["-O3", "--use_fast_math"],
-)
+# ---------------------------------------------------------------------------
+# Lazy-init decode function — tries precompiled cubins first.
+# ---------------------------------------------------------------------------
+
+_decode_fn = None
+
+
+def _init_decode():
+    global _decode_fn
+    if _decode_fn is not None:
+        return
+    from ._kernel_loader import load_decode_fn
+    _decode_fn = load_decode_fn()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def packr_matmul(x, W_p, W_f, lut, bias=None):
     """
     PackR matmul:  out = x @ (W_f + lut[W_p]) + bias
 
-    Strategy (CUDA + cuBLAS):
-      1. decode: CUDA LUT lookup     → decoded [K,N] fp16  (~0.2ms)
-      2. combine: W_f + decoded      → w_full  [K,N] fp32  (~0.05ms)
-      3. matmul: x @ w_full + bias   → out     [M,N] fp32  (~1.4ms cuBLAS)
-                                                      Total: ~1.7ms
+    Strategy:
+      1. decode: LUT lookup     → decoded [K,N] fp16
+      2. combine: W_f + decoded → w_full  [K,N]
+      3. matmul: x @ w_full     → out     [M,N]
 
     Args:
         x:    [M, K] fp32 or bf16 activations
@@ -84,8 +122,9 @@ def packr_matmul(x, W_p, W_f, lut, bias=None):
     K2, N = W_f.shape
     assert K2 == K, f"W_f rows ({K2}) != x cols ({K})"
 
-    # 1. CUDA LUT lookup → fp16
-    decoded = _decode_ext.decode_packed_cuda(W_p, lut.half())
+    _init_decode()
+
+    decoded = _decode_fn(W_p, lut)
 
     # 2. W_f (bf16) + decoded (fp16) → fp32 (PyTorch type promotion)
     w_full = W_f + decoded

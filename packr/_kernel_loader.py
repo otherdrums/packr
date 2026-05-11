@@ -1,167 +1,196 @@
 """Kernel loader — GPU compute capability detection and binary dispatch.
 
-On import, detects the current GPU architecture.  Tries precompiled cubin
-first, then JIT compilation (requires nvcc), then falls back to pure
-PyTorch operations that trade VRAM for portability.
+Detects the current GPU architecture at import time.  Tries precompiled
+cubin first (if available), then Triton/JIT compilation, then CUDA JIT
+(requires nvcc), then falls back to pure PyTorch.
 """
 
 import os
 import torch
 
 
-# ── Architecture detection ──
-
-def _detect_arch() -> str | None:
-    """Return sm_XX string for the current CUDA device, or None if no GPU."""
+def _detect_arch():
     if not torch.cuda.is_available():
         return None
     major, minor = torch.cuda.get_device_capability()
     return f"sm_{major}{minor}"
 
 
-# ── Decode kernel (LUT lookup) ──
-
-def _has_precompiled_decode(arch: str) -> bool:
-    """Check if a precompiled decode kernel exists for the given arch."""
-    base = os.path.dirname(__file__)
-    cubin = os.path.join(base, "..", "kernels", arch, "decode_packed.cubin")
-    return os.path.exists(cubin)
+def _kernels_dir():
+    return os.path.join(os.path.dirname(__file__), "..", "kernels")
 
 
-def _load_precompiled_decode(arch: str):
-    """Load a precompiled decode_packed cubin via load_inline."""
-    from torch.utils.cpp_extension import load_inline
+# ── Triton decode kernel loading ──
 
-    base = os.path.dirname(__file__)
-    cubin_path = os.path.join(base, "..", "kernels", arch, "decode_packed.cubin")
+def _try_load_triton_decode_cubin():
+    """Load a precompiled Triton decode cubin and return a callable.
 
+    Returns None if no matching cubin exists or loading fails.
+    """
+    try:
+        import triton
+        from triton.runtime import driver
+    except ImportError:
+        return None
+
+    arch = _detect_arch()
+    if arch is None:
+        return None
+
+    cubin_path = os.path.join(_kernels_dir(), arch, "decode_packed.cubin")
     if not os.path.exists(cubin_path):
-        raise FileNotFoundError(f"No precompiled kernel for {arch}")
+        return None
 
-    with open(cubin_path, "rb") as f:
-        cubin_data = f.read()
+    try:
+        mod, func, _ = driver.active.utils.load_binary(
+            "decode_packed", cubin_path,
+            driver.active.get_current_stream(),
+        )
+    except Exception:
+        return None
 
-    return load_inline(
-        name=f"packr_decode_{arch}",
-        cpp_sources="torch::Tensor decode_packed_cuda(torch::Tensor W_p, torch::Tensor lut);",
-        functions=["decode_packed_cuda"],
-        extra_ldflags=[f"--cubin={cubin_path}"],
-        with_cuda=True,
-    )
+    # func is a compiled kernel handle — wrap in a callable
+    BLOCK = 256
+
+    def _launch(W_p, lut):
+        N = W_p.numel()
+        out = torch.empty(N, dtype=torch.float16, device=W_p.device)
+        grid = ((N + BLOCK - 1) // BLOCK, 1, 1)
+        func(grid[0], grid[1], grid[2], BLOCK, W_p, lut, out, N)
+        return out.view(W_p.shape)
+
+    return _launch
 
 
-def _jit_compile_decode():
-    """JIT-compile the decode kernel from source (requires nvcc on PATH)."""
-    from kernel import _cuda_source, _cpp_source
-    from torch.utils.cpp_extension import load_inline
+def _try_triton_decode_jit():
+    """Try the Triton JIT path — just call the kernel once to warm up.
 
-    return load_inline(
-        name="packr_decode_jit",
-        cpp_sources=_cpp_source,
-        cuda_sources=_cuda_source,
-        functions=["decode_packed_cuda"],
-        with_cuda=True,
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
-    )
+    Returns a callable (W_p, lut) -> decoded fp16 tensor, or None.
+    """
+    try:
+        from .kernel import _decode_packed_triton
+    except ImportError:
+        return None
+
+    if _decode_packed_triton is None:
+        return None
+
+    BLOCK = 256
+
+    def _call(W_p, lut):
+        N = W_p.numel()
+        out = torch.empty(N, dtype=torch.float16, device=W_p.device)
+        grid = ((N + BLOCK - 1) // BLOCK,)
+        _decode_packed_triton[grid](W_p, lut, out, N, BLOCK=BLOCK)
+        return out.view(W_p.shape)
+
+    return _call
+
+
+def _try_cuda_decode_jit():
+    """CUDA JIT via load_inline.  Requires nvcc on PATH.
+
+    Returns a callable (W_p, lut) -> decoded fp16 tensor, or None.
+    """
+    try:
+        from torch.utils.cpp_extension import load_inline
+        from .kernel import _cuda_source, _cpp_source
+    except ImportError:
+        return None
+
+    try:
+        _ext = load_inline(
+            name="packr_decode_jit",
+            cpp_sources=_cpp_source,
+            cuda_sources=_cuda_source,
+            functions=["decode_packed_cuda"],
+            with_cuda=True,
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+        )
+    except Exception:
+        return None
+
+    def _call(W_p, lut):
+        return _ext.decode_packed_cuda(W_p, lut.half())
+
+    return _call
+
+
+def _fallback_decode(W_p, lut):
+    """Pure-PyTorch LUT lookup — correct but materializes full tensor."""
+    return lut[W_p.long()].to(torch.float16)
+
+
+def load_decode_fn():
+    """Return the best available decode function.
+
+    Priority:
+      1. Precompiled Triton cubin
+      2. Triton JIT (warm-up)
+      3. CUDA JIT (requires nvcc)
+      4. Pure-PyTorch fallback
+    """
+    for attempt in (_try_load_triton_decode_cubin,
+                    _try_triton_decode_jit,
+                    _try_cuda_decode_jit):
+        try:
+            fn = attempt()
+            if fn is not None:
+                return fn
+        except Exception:
+            continue
+    return _fallback_decode
 
 
 # ── Optimizer kernel (fused AdamW) ──
 
-def _has_precompiled_optimizer(arch: str) -> bool:
-    """Check if a precompiled optimizer cubin exists for the given arch."""
-    base = os.path.dirname(__file__)
-    cubin = os.path.join(base, "..", "kernels", arch, "fused_adam_8bit.cubin")
-    return os.path.exists(cubin)
+def has_precompiled_optimizer():
+    arch = _detect_arch()
+    if arch is None:
+        return False
+    path = os.path.join(_kernels_dir(), arch, "fused_adam_8bit.cubin")
+    return os.path.exists(path)
 
 
-def _load_precompiled_optimizer(arch: str):
-    """Load a precompiled Triton cubin for the fused AdamW kernel."""
-    import triton
-    from triton.runtime import driver
+def load_optimizer_cubin():
+    """Load a precompiled Triton cubin for the fused AdamW kernel.
 
-    base = os.path.dirname(__file__)
-    cubin_path = os.path.join(base, "..", "kernels", arch, "fused_adam_8bit.cubin")
-
-    if not os.path.exists(cubin_path):
-        raise FileNotFoundError(f"No precompiled optimizer kernel for {arch}")
-
-    # Load cubin into Triton's runtime
-    _, mod, func, _ = driver.active.load_binary("fused_adam_8bit", cubin_path, driver.active.get_current_stream())
-    return mod, func
-
-
-# ── Module-level state ──
-
-_current_arch = _detect_arch()
-_decode_ext = None
-_adam_cubin = None
-
-HAS_PRECOMPILED = _current_arch is not None and _has_precompiled_decode(_current_arch)
-HAS_NVCC = False  # set True if JIT succeeds
-
-
-# ── Initialization ──
-
-def _init_decode():
-    """Lazy-initialize the decode kernel extension.  Called on first use."""
-    global _decode_ext, HAS_NVCC
-
-    if _decode_ext is not None:
-        return
-
-    arch = _current_arch
-
-    # 1. Try precompiled cubin
-    if arch is not None and _has_precompiled_decode(arch):
-        try:
-            _decode_ext = _load_precompiled_decode(arch)
-            return
-        except Exception:
-            pass
-
-    # 2. Try JIT compilation (needs nvcc)
+    Returns (module, function) or (None, None) on failure.
+    """
     try:
-        _decode_ext = _jit_compile_decode()
-        HAS_NVCC = True
-        return
+        import triton
+        from triton.runtime import driver
+    except ImportError:
+        return None, None
+
+    arch = _detect_arch()
+    if arch is None:
+        return None, None
+
+    cubin_path = os.path.join(_kernels_dir(), arch, "fused_adam_8bit.cubin")
+    if not os.path.exists(cubin_path):
+        return None, None
+
+    try:
+        mod, func, _ = driver.active.utils.load_binary(
+            "fused_adam_8bit", cubin_path,
+            driver.active.get_current_stream(),
+        )
+        return mod, func
     except Exception:
-        pass
-
-    # 3. Fallback — will use _decode_fallback at call time
-    _decode_ext = None
-
-
-def _decode_fallback(W_p, lut):
-    """Pure-PyTorch LUT lookup — correct but materializes full weight tensor.
-
-    Used when no precompiled binary matches the GPU and nvcc is unavailable.
-    """
-    return lut[W_p.long()]
-
-
-def get_decode_fn():
-    """Return the best available decode function.
-
-    Returns:
-        callable: (W_p, lut) -> decoded float tensor
-    """
-    _init_decode()
-
-    if _decode_ext is not None:
-        def _precompiled(W_p, lut):
-            return _decode_ext.decode_packed_cuda(W_p, lut.half())
-        return _precompiled
-
-    return _decode_fallback
+        return None, None
 
 
 # ── Query ──
 
-def kernel_status() -> dict:
-    """Return a human-readable dict describing the kernel loading state."""
+_current_arch = _detect_arch()
+
+
+def kernel_status():
     return {
         "arch": _current_arch,
-        "precompiled_available": HAS_PRECOMPILED,
-        "nvcc_available": HAS_NVCC,
-        "decode_loaded": _decode_ext is not None or HAS_PRECOMPILED,
+        "decode_precompiled": os.path.exists(
+            os.path.join(_kernels_dir(), _current_arch or "none", "decode_packed.cubin")
+        ),
+        "optimizer_precompiled": has_precompiled_optimizer(),
     }
