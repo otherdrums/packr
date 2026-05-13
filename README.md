@@ -1,5 +1,9 @@
 # PackR — Compressed neural network weights with learnable codebooks
 
+> **Warning — Early development.**  PackR is under active development and not
+> yet ready for production use.  APIs and training dynamics are subject to
+> change without notice.  Expect breakage, improvement, and iteration.
+
 Drop-in `nn.Linear` replacement that stores weights as uint8 bytecode indices
 into a trainable 256-entry lookup table plus bfloat16 residual deltas —
 3 bytes/weight, 37% less GPU memory with accuracy matching or exceeding full fine-tune.
