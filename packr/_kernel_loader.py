@@ -17,7 +17,7 @@ def _detect_arch():
 
 
 def _kernels_dir():
-    return os.path.join(os.path.dirname(__file__), "..", "kernels")
+    return os.path.join(os.path.dirname(__file__), "kernels")
 
 
 # ── Triton decode kernel loading ──

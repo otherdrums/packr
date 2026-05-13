@@ -13,7 +13,7 @@ import sys
 
 TARGET_ARCHES = [75, 80, 86, 89, 90]
 PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
-KERNELS_DIR = os.path.join(PROJECT_ROOT, "kernels")
+KERNELS_DIR = os.path.join(PROJECT_ROOT, "packr", "kernels")
 
 os.environ.setdefault("TRITON_ALLOW_AOT", "1")
 
