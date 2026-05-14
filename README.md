@@ -69,6 +69,34 @@ for batch in loader:
     optimizer.zero_grad()
 ```
 
+## Offloading
+
+Stream frozen `W_p` indices and optimizer states from pinned system RAM:
+
+```python
+config = PackRConfig(offload=True)
+model = compress_model(model, config)
+# Training loop unchanged — offloading is transparent
+```
+
+### How It Works
+
+Three mechanisms coordinate transparently:
+
+- **W_p streaming** — A small GPU buffer pool reuses tensors for the current
+  layer's forward pass.  Pinned CPU memory holds canonical uint8 indices.
+  Synchronous default-stream copies avoid races with cuBLAS.
+
+- **Chunked optimizer state streaming** — m/v/scales are stored as pinned CPU
+  tensors grouped into ~100 MB chunks.  During `step()`, each chunk's states
+  are copied to GPU via non-blocking transfers, used by the Triton kernel,
+  then evicted via double-buffered offload-stream DMA overlapping with the
+  next chunk's compute.
+
+- **Automatic wiring** — `compress_model()` creates the OffloadManager and
+  attaches it to every PackRLinear layer and the optimizer.  The training
+  loop needs zero changes — offloading is invisible at the Python level.
+
 ## Velvet — Adaptive Per-Layer Learning Rates  (highly experimental)
 
 > Velvet's auto-tuning behavior is under active research.  The `beta`,
@@ -133,34 +161,6 @@ for step, batch in enumerate(loader):
 | `min_multiplier` | None (auto) | LR floor when velocity flatlines (None = auto from train_samples) |
 | `max_multiplier` | 1.0 | LR ceiling when actively learning |
 | `velocity_scale` | None (auto) | Sensitivity of velocity → multiplier mapping (None = auto from train_samples) |
-
-## Offloading
-
-Stream frozen `W_p` indices and optimizer states from pinned system RAM:
-
-```python
-config = PackRConfig(offload=True)
-model = compress_model(model, config)
-# Training loop unchanged — offloading is transparent
-```
-
-### How It Works
-
-Three mechanisms coordinate transparently:
-
-- **W_p streaming** — A small GPU buffer pool reuses tensors for the current
-  layer's forward pass.  Pinned CPU memory holds canonical uint8 indices.
-  Synchronous default-stream copies avoid races with cuBLAS.
-
-- **Chunked optimizer state streaming** — m/v/scales are stored as pinned CPU
-  tensors grouped into ~100 MB chunks.  During `step()`, each chunk's states
-  are copied to GPU via non-blocking transfers, used by the Triton kernel,
-  then evicted via double-buffered offload-stream DMA overlapping with the
-  next chunk's compute.
-
-- **Automatic wiring** — `compress_model()` creates the OffloadManager and
-  attaches it to every PackRLinear layer and the optimizer.  The training
-  loop needs zero changes — offloading is invisible at the Python level.
 
 ## Requirements
 
