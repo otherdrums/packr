@@ -119,7 +119,8 @@ class TrainerConfig:
     attenuation_skip_threshold: float = ATTENUATION_SKIP_THRESHOLD
 
     # ZPackR
-    post_step_interval: int = 4
+    attenuation_skip_enabled: bool = True
+    attenuation_skip_threshold: float = ATTENUATION_SKIP_THRESHOLD
 
     # Evaluation
     eval_interval: int = 500
@@ -355,11 +356,10 @@ class ZPackRTrainer:
                     if self._velvet is not None:
                         self._velvet.step()
 
-                    # ZPackR post_step
+                    # ZPackR post_step — every step, instantaneous attenuation
                     if self._zpl_layers is not None:
-                        if (self._global_step + 1) % self.config.post_step_interval == 0:
-                            for _, module in self._zpl_layers:
-                                module.post_step()
+                        for _, module in self._zpl_layers:
+                            module.post_step()
 
                     self._optimizer.zero_grad()
 
@@ -582,7 +582,6 @@ def main():
     parser.add_argument("--attenuation-skip", action="store_true", default=True)
     parser.add_argument("--no-attenuation-skip", action="store_false", dest="attenuation_skip")
     parser.add_argument("--attenuation-skip-threshold", type=float, default=ATTENUATION_SKIP_THRESHOLD)
-    parser.add_argument("--post-step-interval", type=int, default=4)
     parser.add_argument("--output-dir", default="runs")
     parser.add_argument("--label", default="")
     parser.add_argument("--seed", type=int, default=42)
@@ -601,7 +600,6 @@ def main():
         velvet_enabled=args.velvet,
         attenuation_skip_enabled=args.attenuation_skip,
         attenuation_skip_threshold=args.attenuation_skip_threshold,
-        post_step_interval=args.post_step_interval,
         output_dir=args.output_dir,
         run_label=args.label,
         seed=args.seed,
