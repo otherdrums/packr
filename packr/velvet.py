@@ -29,6 +29,7 @@ class VelvetController:
     beta : float
         EMA smoothing coefficient for velocity (0 < beta < 1).
         Higher = more smoothing, slower to react.  Default 0.97.
+        Set to None to auto-tune from total_opt_steps.
     min_multiplier : float
         Minimum LR multiplier applied when velocity is near zero
         (layer is saturating).  Default 0.175.
@@ -39,6 +40,13 @@ class VelvetController:
         Scaling factor that maps normalized velocity to the [0,1] range
         before clamping to [min_multiplier, max_multiplier].
         Higher = more aggressive LR reduction.  Default 10.0.
+        Set to None to auto-tune from total_opt_steps.
+    train_samples : int, optional
+        Number of training examples in the dataset.  When provided and
+        beta/min_multiplier/velocity_scale are None, all four are
+        auto-tuned from a single scale factor derived purely from
+        dataset size — invariant to batch size and accumulation steps.
+        Normalization point: 32,000 examples (≈ B⊂8 × acc⊂4 × 1,000 opt steps).
     """
 
     def __init__(
@@ -48,7 +56,43 @@ class VelvetController:
         min_multiplier: float = 0.175,
         max_multiplier: float = 1.0,
         velocity_scale: float = 10.0,
+        train_samples: Optional[int] = None,
+        total_opt_steps: Optional[int] = None,
+        opt_steps_per_epoch: Optional[int] = None,
     ):
+        velocity_scale_default = 10.0  # used as reference for auto-tuning
+
+        tuning_steps = train_samples
+        if tuning_steps is None:
+            tuning_steps = opt_steps_per_epoch
+        if tuning_steps is None:
+            tuning_steps = total_opt_steps
+
+        if tuning_steps is not None and tuning_steps > 0:
+            if train_samples is not None:
+                scale = min(1.0, (tuning_steps / 32000.0) ** 0.33)
+            else:
+                scale = min(1.0, (tuning_steps / 1000.0) ** 0.33)
+            auto_half_life = max(5, int(25.0 * scale))
+            if beta is None:
+                beta = 0.5 ** (1.0 / auto_half_life)
+                min_multiplier = 0.175 + 0.325 * (1.0 - scale)
+                v_ref_half_life = max(3, int(23.0 * scale))
+                self._v_ref_beta = 0.5 ** (1.0 / v_ref_half_life)
+                self._auto_tuned = True
+                self._min_observation_steps = 1
+            else:
+                self._v_ref_beta = 0.97
+                self._auto_tuned = False
+                self._min_observation_steps = 1
+            if velocity_scale is None:
+                velocity_scale = 1.5 + (velocity_scale_default - 1.5) * scale
+        else:
+            self._auto_tuned = False
+            self._min_observation_steps = 1
+        if velocity_scale is None:
+            velocity_scale = velocity_scale_default
+
         if not 0 < beta < 1:
             raise ValueError(f"beta must be in (0, 1), got {beta}")
         if not 0 <= min_multiplier <= max_multiplier:
@@ -64,8 +108,8 @@ class VelvetController:
         self.vel_scale = velocity_scale
 
         # Per-parameter tracking, keyed by id(p)
-        self._prev_v_mean: Dict[int, float] = {}   # v_mean from previous step
-        self._ema_velocity: Dict[int, float] = {}   # EMA-filtered Δv
+        self._v_ref: Dict[int, float] = {}           # slow EMA of v_mean (reference level)
+        self._ema_velocity: Dict[int, float] = {}   # EMA-filtered velocity
         self._base_lr: Dict[int, float] = {}        # group_idx → base_lr
 
         # Capture base LRs immediately (before warmup or any scheduling
@@ -105,13 +149,15 @@ class VelvetController:
         Reads the freshly-updated ``v`` (exp_avg_sq) states, computes
         the filtered velocity, and translates it to per-group LR multipliers.
 
-        The first call is observation-only — it seeds ``prev_v_mean``
-        without adjusting LRs.  All subsequent calls apply the
-        velocity→LR translation.  Base LRs are captured at construction
-        time so warmup cannot corrupt them.
+        During the observation window (auto-tuned from dataset size), EMA
+        accumulates velocity estimates but LRs stay at max multiplier.
+        After the window closes, the velocity→LR translation engages.
+        Base LRs are captured at construction time so warmup cannot
+        corrupt them.
         """
         self._step_count += 1
         is_first = self._step_count == 1
+        observing = self._step_count <= self._min_observation_steps
 
         for group_idx, group in enumerate(self._optimizer.param_groups):
             multipliers: List[float] = []
@@ -128,27 +174,38 @@ class VelvetController:
                 # ---- dequantize and compute mean of v ----
                 v_mean = self._dequantize_v_mean(state["v"], state.get("v_scale"))
 
-                if is_first or pid not in self._prev_v_mean:
-                    # First call: seed state, use max multiplier
-                    self._prev_v_mean[pid] = v_mean
+                if is_first or pid not in self._v_ref:
+                    # Seed both reference EMA and velocity EMA at v_mean.
+                    self._v_ref[pid] = v_mean
                     self._ema_velocity[pid] = 0.0
                     multipliers.append(self.max_m)
                     continue
 
-                # ---- compute velocity ----
-                prev = self._prev_v_mean[pid]
-                self._prev_v_mean[pid] = v_mean
-                delta = v_mean - prev
+                # ---- update slow v_mean reference (trend line) ----
+                v_ref_old = self._v_ref[pid]
+                v_ref_new = self._v_ref_beta * v_ref_old + (1.0 - self._v_ref_beta) * v_mean
+                self._v_ref[pid] = v_ref_new
 
-                # ---- EMA filter ----
+                # ---- velocity = reference's own rate of change, denoised ----
+                # v_ref is a slow EMA — its per-step movement is tiny.
+                # Normalize by (1−β) to recover the equivalent v_mean shift,
+                # so velocity scale is independent of v_ref_new inertia.
+                delta = (v_ref_new - v_ref_old) / (1.0 - self._v_ref_beta)
+
+                # ---- EMA filter on velocity ----
                 ema = (
                     self.beta * self._ema_velocity[pid]
                     + (1.0 - self.beta) * delta
                 )
                 self._ema_velocity[pid] = ema
 
-                # ---- normalize by current v_mean (relative rate of change) ----
-                norm_vel = abs(ema) / (v_mean + 1e-12)
+                # ---- observation window: keep max LR, let EMA accumulate ----
+                if observing:
+                    multipliers.append(self.max_m)
+                    continue
+
+                # ---- normalize by reference (not current v_mean) ----
+                norm_vel = abs(ema) / (v_ref_new + 1e-12)
 
                 # ---- translate to multiplier ----
                 multiplier = self.min_m + (self.max_m - self.min_m) * min(
@@ -166,7 +223,7 @@ class VelvetController:
                 self._stats["step"].append(self._step_count)
                 self._stats["group"].append(group_idx)
                 self._stats["v_mean"].append(
-                    self._prev_v_mean.get(sample_id, 0.0)
+                    self._v_ref.get(sample_id, 0.0)
                 )
                 self._stats["velocity"].append(
                     self._ema_velocity.get(sample_id, 0.0)
@@ -191,6 +248,13 @@ class VelvetController:
 
         return {
             "step_count": self._step_count,
+            "beta": self.beta,
+            "v_ref_beta": self._v_ref_beta,
+            "vel_scale": self.vel_scale,
+            "min_multiplier": self.min_m,
+            "max_multiplier": self.max_m,
+            "auto_tuned": self._auto_tuned,
+            "observation_steps": self._min_observation_steps,
             "per_group": per_group,
             "history": {
                 "steps": self._stats["step"][-100:],  # last 100
