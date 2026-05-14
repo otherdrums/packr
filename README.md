@@ -57,8 +57,8 @@ model.cuda()
 # 8-bit AdamW optimizer (full beta1=0.9 momentum, 6 bytes/param saved)
 optimizer = FusedQuantizedAdam(model.parameters(), lr=2e-5, betas=(0.9, 0.999))
 
-# Velvet: adaptive per-layer LR from gradient velocity (optional)
-velvet = VelvetController(optimizer, beta=0.97, min_multiplier=0.175)
+# Velvet: adaptive per-layer LR from gradient velocity (optional, experimental)
+velvet = VelvetController(optimizer, train_samples=42190)  # auto-tunes all knobs
 
 # Standard PyTorch training loop — no changes
 for batch in loader:
@@ -69,7 +69,15 @@ for batch in loader:
     optimizer.zero_grad()
 ```
 
-## Velvet — Adaptive Per-Layer Learning Rates
+## Velvet — Adaptive Per-Layer Learning Rates  🧪 highly experimental
+
+> Velvet's auto-tuning behavior is under active research.  The `beta`,
+> `velocity_scale`, `min_multiplier`, and `v_ref_beta` parameters are currently
+> derived from a single `train_samples` value using a heuristic scale factor.
+> This mapping is unstable across dataset sizes and may produce suboptimal
+> results on micro-datasets (< 5K examples).  Expect the auto-tuning formula
+> and defaults to evolve rapidly.  Use `verbose=True` and monitor the per-group
+> multiplier stats during training.
 
 Velvet (Velocity to Learning Rate Translation) replaces hand-tuned LR schedules
 with real-time closed-loop adaptation.  Every optimizer step, it reads each
@@ -120,10 +128,11 @@ for step, batch in enumerate(loader):
 
 | Parameter | Default | Role |
 |-----------|:------:|------|
-| `beta` | 0.97 | EMA smoothing (higher = slower to react) |
-| `min_multiplier` | 0.175 | LR floor when velocity flatlines |
+| `train_samples` | None | Dataset size — if set, auto-tunes beta, velocity_scale, min_multiplier, and v_ref_beta from a single scale factor. |
+| `beta` | None (auto) | EMA smoothing for velocity (None = auto from train_samples) |
+| `min_multiplier` | None (auto) | LR floor when velocity flatlines (None = auto from train_samples) |
 | `max_multiplier` | 1.0 | LR ceiling when actively learning |
-| `velocity_scale` | 10.0 | Sensitivity of velocity → multiplier mapping |
+| `velocity_scale` | None (auto) | Sensitivity of velocity → multiplier mapping (None = auto from train_samples) |
 
 ## Offloading
 
