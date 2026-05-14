@@ -1,4 +1,4 @@
-"""Layer patcher — replaces nn.Linear layers with PackRLinear in any HF model."""
+"""Layer patcher — replaces nn.Linear layers with PackRLinear or ZPackRLinear."""
 
 import torch.nn as nn
 from .layer import PackRLinear
@@ -8,15 +8,18 @@ from .offload import OffloadManager
 
 def compress_model(model: nn.Module, config: PackRConfig = None):
     """
-    Replace nn.Linear layers in a model with PackR-compressed equivalents.
+    Replace nn.Linear layers in a model with PackR or ZPackR compressed equivalents.
 
     Returns:
-        model: nn.Module with PackRLinear layers.
-        The OffloadManager (if active) is attached as model._offload_manager.
+        model: nn.Module with PackRLinear or ZPackRLinear layers.
     """
     if config is None:
         config = PackRConfig()
 
+    if config.mode == "zpackr":
+        return _compress_zpackr(model, config)
+
+    # ── PackR mode (default) ──
     packr_layers = []  # ordered (name, PackRLinear) for offload sequencing
 
     for name, module in list(model.named_modules()):
@@ -41,7 +44,6 @@ def compress_model(model: nn.Module, config: PackRConfig = None):
         _enable_gradient_checkpointing(model)
 
     if config.offload and packr_layers:
-        # Model must be on CUDA before we can capture W_p for offloading.
         if next(model.parameters()).is_cpu:
             model.cuda()
 
@@ -55,6 +57,33 @@ def compress_model(model: nn.Module, config: PackRConfig = None):
         model._offload_manager = mgr
 
     return model
+
+
+def _compress_zpackr(model: nn.Module, config: PackRConfig):
+    """Replace nn.Linear layers with ZPackRLinear (frozen base + LZ4 delta)."""
+    from .zpackr_layer import ZPackRLinear
+
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        if not _matches_scope(name, config.layer_scope):
+            continue
+
+        zpackr = ZPackRLinear.from_linear(module)
+        _replace_module(model, name, zpackr)
+
+    if config.gradient_checkpointing:
+        _enable_gradient_checkpointing(model)
+
+    return model
+
+
+def _replace_module(model, name, new_module):
+    parent = model
+    parts = name.split(".")
+    for part in parts[:-1]:
+        parent = getattr(parent, part)
+    setattr(parent, parts[-1], new_module)
 
 
 def _matches_scope(name: str, scope: str) -> bool:

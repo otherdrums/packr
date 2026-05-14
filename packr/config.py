@@ -5,6 +5,7 @@ from typing import Optional, Literal
 
 
 SchemeType = Literal["phr"]
+ModeType = Literal["packr", "zpackr"]
 
 
 @dataclass
@@ -12,16 +13,17 @@ class PackRConfig:
     """Configuration for PackR-based memory-efficient fine-tuning.
 
     Args:
+        mode:                   "packr" or "zpackr"
         scheme:                 Compression scheme (currently only "phr")
         learnable_lut:          Whether the LUT codebook is trainable
         layer_scope:            Which linear layers to replace
         gradient_checkpointing: Enable gradient checkpointing on the backbone
         use_8bit_optimizer:     Use FusedQuantizedAdam (Triton 8-bit Adam)
         offload:                Enable CPU/system RAM offloading
-                                (W_p streaming + optimizer state streaming)
         block_size:             Quantization block size for 8-bit optimizer
     """
 
+    mode: ModeType = "packr"
     scheme: SchemeType = "phr"
     learnable_lut: bool = True
     layer_scope: Literal["ffn", "attention", "all"] = "ffn"
