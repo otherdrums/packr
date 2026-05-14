@@ -19,6 +19,7 @@ import os
 import sys
 import json
 import time
+import threading
 from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -75,6 +76,11 @@ class DiagnosticTrainer(ZPackRTrainer):
 
             step_start = time.perf_counter()
 
+            # Swap in attenuation from background thread
+            if self._zpl_layers is not None:
+                for _, module in self._zpl_layers:
+                    module.swap_attenuation()
+
             # ── Forward ──
             labels = batch.pop("label", None)
             batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
@@ -109,15 +115,19 @@ class DiagnosticTrainer(ZPackRTrainer):
                     if self._velvet is not None:
                         self._velvet.step()
 
-                    if self._zpl_layers is not None:
-                        for _, module in self._zpl_layers:
-                            module.post_step()
-
                     self._optimizer.zero_grad()
 
+                    # Stage delta, then launch async zstd compression
                     if self._zpl_layers is not None:
                         for _, module in self._zpl_layers:
                             module.stage_delta_async(None)
+                        for _, module in self._zpl_layers:
+                            if module._attenuation_thread is not None:
+                                module._attenuation_thread.join()
+                            module.apply_staged_delta()
+                            t = threading.Thread(target=module._compress_async, daemon=True)
+                            t.start()
+                            module._attenuation_thread = t
 
             # ── Log ratios every step (cached between post_steps) ──
             if self._zpl_layers is not None:

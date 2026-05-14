@@ -30,6 +30,7 @@ from typing import Optional, Literal
 import torch
 import torch.nn as nn
 import numpy as np
+import threading
 
 # Ensure packr is importable from tools/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -322,6 +323,11 @@ class ZPackRTrainer:
 
             step_start = time.perf_counter()
 
+            # Swap in attenuation from background thread (computed during last forward)
+            if self._zpl_layers is not None:
+                for _, module in self._zpl_layers:
+                    module.swap_attenuation()
+
             # ── Forward ──
             labels = batch.pop("label", None)
             batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
@@ -356,17 +362,25 @@ class ZPackRTrainer:
                     if self._velvet is not None:
                         self._velvet.step()
 
-                    # ZPackR post_step — every step, instantaneous attenuation
-                    if self._zpl_layers is not None:
-                        for _, module in self._zpl_layers:
-                            module.post_step()
-
                     self._optimizer.zero_grad()
 
-                    # Pre-stage delta for next post_step
+                    # Stage delta GPU→CPU for background compression
                     if self._zpl_layers is not None:
                         for _, module in self._zpl_layers:
                             module.stage_delta_async(None)
+
+                    # Launch zstd compression in background thread
+                    if self._zpl_layers is not None:
+                        for _, module in self._zpl_layers:
+                            # Wait for previous thread to finish
+                            if module._attenuation_thread is not None:
+                                module._attenuation_thread.join()
+                            # Consume staged delta into _full_delta
+                            module.apply_staged_delta()
+                            # Launch compression in thread
+                            t = threading.Thread(target=module._compress_async, daemon=True)
+                            t.start()
+                            module._attenuation_thread = t
 
             # ── Record step ──
             step_ms = (time.perf_counter() - step_start) * 1000
