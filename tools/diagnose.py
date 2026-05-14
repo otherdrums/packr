@@ -117,17 +117,23 @@ class DiagnosticTrainer(ZPackRTrainer):
 
                     self._optimizer.zero_grad()
 
-                    # Stage delta, then launch async zstd compression
+                    # Stage delta, apply to _full_delta
                     if self._zpl_layers is not None:
                         for _, module in self._zpl_layers:
                             module.stage_delta_async(None)
                         for _, module in self._zpl_layers:
-                            if module._attenuation_thread is not None:
-                                module._attenuation_thread.join()
                             module.apply_staged_delta()
-                            t = threading.Thread(target=module._compress_async, daemon=True)
-                            t.start()
-                            module._attenuation_thread = t
+
+                    # Single background thread for all layers
+                    if self._zpl_layers is not None:
+                        if self._zstd_thread is not None:
+                            self._zstd_thread.join()
+
+                        def compress_all():
+                            for _, module in self._zpl_layers:
+                                module._compress_async()
+                        self._zstd_thread = threading.Thread(target=compress_all, daemon=True)
+                        self._zstd_thread.start()
 
             # ── Log ratios every step (cached between post_steps) ──
             if self._zpl_layers is not None:

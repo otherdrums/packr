@@ -174,6 +174,7 @@ class ZPackRTrainer:
         self._gate_skipped_total = 0
         self._gate_total = 0
         self._zpl_layers = None  # cached list of ZPackRLinear instances
+        self._zstd_thread = None  # background zstd compression thread
         self._peak_vram = 0      # max VRAM seen during run
         self._last_eval_time = None  # for throughput display
         self._metrics_buffer = [] # batched flush every N steps
@@ -364,23 +365,23 @@ class ZPackRTrainer:
 
                     self._optimizer.zero_grad()
 
-                    # Stage delta GPU→CPU for background compression
+                    # Stage delta GPU→CPU, then apply to _full_delta
                     if self._zpl_layers is not None:
                         for _, module in self._zpl_layers:
                             module.stage_delta_async(None)
-
-                    # Launch zstd compression in background thread
-                    if self._zpl_layers is not None:
                         for _, module in self._zpl_layers:
-                            # Wait for previous thread to finish
-                            if module._attenuation_thread is not None:
-                                module._attenuation_thread.join()
-                            # Consume staged delta into _full_delta
                             module.apply_staged_delta()
-                            # Launch compression in thread
-                            t = threading.Thread(target=module._compress_async, daemon=True)
-                            t.start()
-                            module._attenuation_thread = t
+
+                    # Launch single background thread to compress all layers
+                    if self._zpl_layers is not None:
+                        if self._zstd_thread is not None:
+                            self._zstd_thread.join()
+
+                        def compress_all():
+                            for _, module in self._zpl_layers:
+                                module._compress_async()
+                        self._zstd_thread = threading.Thread(target=compress_all, daemon=True)
+                        self._zstd_thread.start()
 
             # ── Record step ──
             step_ms = (time.perf_counter() - step_start) * 1000
