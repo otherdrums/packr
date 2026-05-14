@@ -69,7 +69,7 @@ for batch in loader:
     optimizer.zero_grad()
 ```
 
-## Velvet — Adaptive Per-Layer Learning Rates  🧪 highly experimental
+## Velvet — Adaptive Per-Layer Learning Rates  (highly experimental)
 
 > Velvet's auto-tuning behavior is under active research.  The `beta`,
 > `velocity_scale`, `min_multiplier`, and `v_ref_beta` parameters are currently
@@ -79,7 +79,7 @@ for batch in loader:
 > and defaults to evolve rapidly.  Use `verbose=True` and monitor the per-group
 > multiplier stats during training.
 
-Velvet (Velocity to Learning Rate Translation) replaces hand-tuned LR schedules
+Velvet (Velocity to Learning Rate Translation) aims to replace hand-tuned LR schedules
 with real-time closed-loop adaptation.  Every optimizer step, it reads each
 layer's `exp_avg_sq` (the AdamW second-moment buffer), computes the filtered
 velocity of gradient variance, and translates that velocity to a per-layer LR
