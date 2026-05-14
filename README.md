@@ -24,7 +24,7 @@ pip install packr
   velocity every optimizer step, EMA-filters out micro-batch noise, dynamically
   throttles saturated layers while keeping hungry layers at full learning rate
 - **Drop-in replacement** — `compress_model(model)` converts any HuggingFace model
-- **Dual mode** — `mode="packr"` (LUT codebook) or `mode="zpackr"` (LZ4 delta attenuation, via [zpackr](https://github.com/otherdrums/zpackr))
+- **Dual mode** — `mode="packr"` (LUT codebook) or `mode="zpackr"` (zstd compressed, via [zpackr](https://github.com/otherdrums/zpackr))
 
 ## How It Works
 
