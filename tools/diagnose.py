@@ -215,6 +215,8 @@ def main():
     parser.add_argument("--attenuation-skip", action="store_true", default=True)
     parser.add_argument("--no-attenuation-skip", action="store_false", dest="attenuation_skip")
     parser.add_argument("--attenuation-skip-threshold", type=float, default=ATTENUATION_SKIP_THRESHOLD)
+    parser.add_argument("--bf16", action="store_true", default=False,
+                        help="Convert model to bfloat16 (saves ~100MB VRAM)")
     parser.add_argument("--output-dir", default="runs")
     parser.add_argument("--label", default="", help="Prefix for output directory")
     parser.add_argument("--seed", type=int, default=42)
@@ -223,7 +225,7 @@ def main():
     config = TrainerConfig(
         model_name=args.model,
         task_name=args.task,
-        packr_config=PackRConfig(mode="zpackr"),
+        packr_config=PackRConfig(mode="zpackr", bf16=args.bf16),
         lr=args.lr,
         batch_size=args.batch_size,
         max_steps=args.max_steps,

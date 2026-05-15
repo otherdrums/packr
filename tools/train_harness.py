@@ -216,6 +216,11 @@ class ZPackRTrainer:
             self.config.model_name, num_labels=self.config.num_labels,
         )
 
+        # Optional bf16 conversion (saves ~100MB VRAM, no quality loss)
+        if self.config.packr_config.bf16:
+            self._model = self._model.to(torch.bfloat16)
+            self._log(f"  Converted model to bfloat16")
+
         # Compress
         self._log(f"Compressing model (mode={self.config.packr_config.mode}) ...")
         self._model = compress_model(self._model, self.config.packr_config)
@@ -580,6 +585,8 @@ def main():
     parser.add_argument("--attenuation-skip", action="store_true", default=True)
     parser.add_argument("--no-attenuation-skip", action="store_false", dest="attenuation_skip")
     parser.add_argument("--attenuation-skip-threshold", type=float, default=ATTENUATION_SKIP_THRESHOLD)
+    parser.add_argument("--bf16", action="store_true", default=False,
+                        help="Convert model to bfloat16 (saves ~100MB VRAM)")
     parser.add_argument("--output-dir", default="runs")
     parser.add_argument("--label", default="")
     parser.add_argument("--seed", type=int, default=42)
@@ -588,7 +595,7 @@ def main():
     config = TrainerConfig(
         model_name=args.model,
         task_name=args.task,
-        packr_config=PackRConfig(mode=args.mode),
+        packr_config=PackRConfig(mode=args.mode, bf16=args.bf16),
         lr=args.lr,
         batch_size=args.batch_size,
         max_steps=args.max_steps,
