@@ -75,8 +75,10 @@ class DiagnosticTrainer(ZPackRTrainer):
                     batch = next(train_iter)
 
                 step_start = time.perf_counter()
+                self._step_timers = {}
 
                 # ── Forward ──
+                t0 = time.perf_counter()
                 labels = batch.pop("label", None)
                 batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
                 if labels is not None:
@@ -84,8 +86,10 @@ class DiagnosticTrainer(ZPackRTrainer):
 
                 outputs = self._model(**batch_gpu, labels=labels)
                 loss = outputs.loss / self.config.grad_accum_steps
+                self._step_timers['forward'] = time.perf_counter() - t0
 
                 # ── Convergence gate ──
+                t0 = time.perf_counter()
                 gate_skipped = False
                 if self.config.attenuation_skip_enabled and self._zpl_layers is not None:
                     gate_skipped = should_skip_backward(
@@ -94,11 +98,15 @@ class DiagnosticTrainer(ZPackRTrainer):
                     if gate_skipped:
                         self._gate_skipped_total += 1
                     self._gate_total += 1
+                self._step_timers['gate'] = time.perf_counter() - t0
 
                 if not gate_skipped:
+                    t0 = time.perf_counter()
                     loss.backward()
+                    self._step_timers['backward'] = time.perf_counter() - t0
 
                     if (self._global_step + 1) % self.config.grad_accum_steps == 0:
+                        t0 = time.perf_counter()
                         self._optimizer.step()
 
                         if self.config.warmup_steps > 0 and self._velvet is not None:
@@ -111,15 +119,20 @@ class DiagnosticTrainer(ZPackRTrainer):
                             self._velvet.step()
 
                         self._optimizer.zero_grad()
+                        self._step_timers['optimizer'] = time.perf_counter() - t0
 
                 # Compute LSH hash every step (even when gate fires), update window
+                t0 = time.perf_counter()
                 if self._zpl_layers is not None:
                     for _, module in self._zpl_layers:
                         module.compute_hash_gpu()
+                self._step_timers['hash'] = time.perf_counter() - t0
 
                 # ── Log ratios every step ──
+                t0 = time.perf_counter()
                 if self._zpl_layers is not None:
                     self._log_ratios(loss.item(), gate_skipped)
+                self._step_timers['ratio_log'] = time.perf_counter() - t0
 
                 step_ms = (time.perf_counter() - step_start) * 1000
                 self._record_step(self._gather_metrics(
