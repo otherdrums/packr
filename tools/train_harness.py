@@ -220,12 +220,24 @@ class ZPackRTrainer:
         self._log(f"Compressing model (mode={self.config.packr_config.mode}) ...")
         self._model = compress_model(self._model, self.config.packr_config)
 
-        # Optional bf16 for non-norm/embedding params (saves ~60MB VRAM)
+        # Optional bf16 conversion (saves ~60MB VRAM).
+        # LayerNorm is reverted to fp32 and forward patched to accept bf16
+        # input by casting internally — F.layer_norm in this PyTorch version
+        # requires matching dtypes.
         if self.config.packr_config.bf16:
-            for name, param in self._model.named_parameters():
-                if not any(x in name for x in ['LayerNorm', 'layer_norm', 'embeddings']):
-                    param.data = param.data.to(torch.bfloat16)
-            self._log(f"  Converted non-norm params to bfloat16")
+            import torch.nn.functional as F
+            self._model = self._model.to(torch.bfloat16)
+            for module in self._model.modules():
+                if isinstance(module, nn.LayerNorm):
+                    module.to(torch.float32)
+            if not getattr(nn.LayerNorm, '_zpackr_bf16_patched', False):
+                _orig_ln = nn.LayerNorm.forward
+                def _bf16_ln(self, input):
+                    return _orig_ln(self, input.float()).bfloat16() \
+                        if input.dtype == torch.bfloat16 else _orig_ln(self, input)
+                nn.LayerNorm.forward = _bf16_ln
+                nn.LayerNorm._zpackr_bf16_patched = True
+            self._log(f"  Converted model to bfloat16")
 
         self._model = self._model.to(self.device)
 
