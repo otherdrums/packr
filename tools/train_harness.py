@@ -219,6 +219,10 @@ class ZPackRTrainer:
         # Optional bf16 conversion (saves ~100MB VRAM, no quality loss)
         if self.config.packr_config.bf16:
             self._model = self._model.to(torch.bfloat16)
+            # LayerNorm requires float32 internally — revert norm layers
+            for module in self._model.modules():
+                if isinstance(module, nn.LayerNorm):
+                    module.to(torch.float32)
             self._log(f"  Converted model to bfloat16")
 
         # Compress
