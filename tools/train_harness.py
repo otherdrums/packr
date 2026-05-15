@@ -40,7 +40,7 @@ from packr.layer_patcher import compress_model
 from packr.optim import FusedQuantizedAdam
 from packr.velvet import VelvetController
 from packr.prompt_gate import should_skip_backward
-from packr.zpackr_layer import ZPackRLinear, ATTENUATION_SKIP_THRESHOLD
+from packr.zpackr_layer import ZPackRLinear, ATTENUATION_SKIP_THRESHOLD, DeltaAccumulator
 
 
 def _git_commit_short():
@@ -227,6 +227,11 @@ class ZPackRTrainer:
                 for name, m in self._model.named_modules()
                 if isinstance(m, ZPackRLinear)
             ]
+            # Shared DeltaAccumulator — all layers contribute to same history
+            accumulator = DeltaAccumulator()
+            for _, module in self._zpl_layers:
+                module._accumulator = accumulator
+            self._log(f"  DeltaAccumulator attached to {len(self._zpl_layers)} layers")
 
         # Dataset
         from datasets import load_dataset
