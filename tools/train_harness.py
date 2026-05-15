@@ -216,18 +216,17 @@ class ZPackRTrainer:
             self.config.model_name, num_labels=self.config.num_labels,
         )
 
-        # Optional bf16 conversion (saves ~100MB VRAM, no quality loss)
-        if self.config.packr_config.bf16:
-            self._model = self._model.to(torch.bfloat16)
-            # LayerNorm requires float32 internally — revert norm layers
-            for module in self._model.modules():
-                if isinstance(module, nn.LayerNorm):
-                    module.to(torch.float32)
-            self._log(f"  Converted model to bfloat16")
-
-        # Compress
+        # Compress first (FFN → ZPackRLinear, base_W already bf16)
         self._log(f"Compressing model (mode={self.config.packr_config.mode}) ...")
         self._model = compress_model(self._model, self.config.packr_config)
+
+        # Optional bf16 for non-norm/embedding params (saves ~60MB VRAM)
+        if self.config.packr_config.bf16:
+            for name, param in self._model.named_parameters():
+                if not any(x in name for x in ['LayerNorm', 'layer_norm', 'embeddings']):
+                    param.data = param.data.to(torch.bfloat16)
+            self._log(f"  Converted non-norm params to bfloat16")
+
         self._model = self._model.to(self.device)
 
         # Cache ZPackRLinear layers to avoid walking named_modules every step
