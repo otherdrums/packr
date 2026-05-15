@@ -30,7 +30,6 @@ from typing import Optional, Literal
 import torch
 import torch.nn as nn
 import numpy as np
-import threading
 
 # Ensure packr is importable from tools/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -40,7 +39,7 @@ from packr.layer_patcher import compress_model
 from packr.optim import FusedQuantizedAdam
 from packr.velvet import VelvetController
 from packr.prompt_gate import should_skip_backward
-from packr.zpackr_layer import ZPackRLinear, ATTENUATION_SKIP_THRESHOLD, DeltaAccumulator
+from packr.zpackr_layer import ZPackRLinear, ATTENUATION_SKIP_THRESHOLD
 
 
 def _git_commit_short():
@@ -120,6 +119,9 @@ class TrainerConfig:
     attenuation_skip_threshold: float = ATTENUATION_SKIP_THRESHOLD
 
     # ZPackR
+    post_step_interval: int = 4
+
+    # ZPackR
     attenuation_skip_enabled: bool = True
     attenuation_skip_threshold: float = ATTENUATION_SKIP_THRESHOLD
 
@@ -174,7 +176,6 @@ class ZPackRTrainer:
         self._gate_skipped_total = 0
         self._gate_total = 0
         self._zpl_layers = None  # cached list of ZPackRLinear instances
-        self._zstd_thread = None  # background zstd compression thread
         self._peak_vram = 0      # max VRAM seen during run
         self._last_eval_time = None  # for throughput display
         self._metrics_buffer = [] # batched flush every N steps
@@ -227,11 +228,7 @@ class ZPackRTrainer:
                 for name, m in self._model.named_modules()
                 if isinstance(m, ZPackRLinear)
             ]
-            # Shared DeltaAccumulator — all layers contribute to same history
-            accumulator = DeltaAccumulator()
-            for _, module in self._zpl_layers:
-                module._accumulator = accumulator
-            self._log(f"  DeltaAccumulator attached to {len(self._zpl_layers)} layers")
+            self._log(f"  {len(self._zpl_layers)} ZPackRLinear layers with per-layer LSH")
 
         # Dataset
         from datasets import load_dataset
@@ -320,95 +317,80 @@ class ZPackRTrainer:
         self._model.train()
         train_iter = iter(self._train_loader)
 
-        while self._global_step < self.config.max_steps:
-            try:
-                batch = next(train_iter)
-            except StopIteration:
-                train_iter = iter(self._train_loader)
-                batch = next(train_iter)
+        try:
+            while self._global_step < self.config.max_steps:
+                try:
+                    batch = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(self._train_loader)
+                    batch = next(train_iter)
 
-            step_start = time.perf_counter()
+                step_start = time.perf_counter()
 
-            # Swap in attenuation from background thread (computed during last forward)
-            if self._zpl_layers is not None:
-                for _, module in self._zpl_layers:
-                    module.swap_attenuation()
+                # ── Forward ──
+                labels = batch.pop("label", None)
+                batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
+                if labels is not None:
+                    labels = labels.to(self.device)
 
-            # ── Forward ──
-            labels = batch.pop("label", None)
-            batch_gpu = {k: v.to(self.device) for k, v in batch.items()}
-            if labels is not None:
-                labels = labels.to(self.device)
+                outputs = self._model(**batch_gpu, labels=labels)
+                loss = outputs.loss / self.config.grad_accum_steps
 
-            outputs = self._model(**batch_gpu, labels=labels)
-            loss = outputs.loss / self.config.grad_accum_steps
+                # ── Convergence gate: skip backward if all blocks fully attenuated ──
+                gate_skipped = False
+                if self.config.attenuation_skip_enabled and self._zpl_layers is not None:
+                    gate_skipped = should_skip_backward(
+                        self._zpl_layers, self.config.attenuation_skip_threshold
+                    )
+                    if gate_skipped:
+                        self._gate_skipped_total += 1
+                    self._gate_total += 1
 
-            # ── Convergence gate: skip backward if all blocks fully attenuated ──
-            gate_skipped = False
-            if self.config.attenuation_skip_enabled and self._zpl_layers is not None:
-                gate_skipped = should_skip_backward(
-                    self._zpl_layers, self.config.attenuation_skip_threshold
-                )
-                if gate_skipped:
-                    self._gate_skipped_total += 1
-                self._gate_total += 1
+                if not gate_skipped:
+                    loss.backward()
 
-            if not gate_skipped:
-                loss.backward()
+                    if (self._global_step + 1) % self.config.grad_accum_steps == 0:
+                        self._optimizer.step()
 
-                if (self._global_step + 1) % self.config.grad_accum_steps == 0:
-                    self._optimizer.step()
+                        # Warmup
+                        if self.config.warmup_steps > 0 and self._velvet is not None:
+                            if self._global_step < self.config.warmup_steps:
+                                self._velvet.warmup_step(self._global_step, self.config.warmup_steps)
 
-                    # Warmup
-                    if self.config.warmup_steps > 0 and self._velvet is not None:
-                        if self._global_step < self.config.warmup_steps:
-                            self._velvet.warmup_step(self._global_step, self.config.warmup_steps)
+                        # Velvet
+                        if self._velvet is not None:
+                            self._velvet.step()
 
-                    # Velvet
-                    if self._velvet is not None:
-                        self._velvet.step()
+                        self._optimizer.zero_grad()
 
-                    self._optimizer.zero_grad()
+                # Compute LSH hash every step (even when gate fires), update window
+                if self._zpl_layers is not None:
+                    for _, module in self._zpl_layers:
+                        module.compute_hash_gpu()
 
-                    # Stage delta GPU→CPU, then apply to _full_delta
-                    if self._zpl_layers is not None:
-                        for _, module in self._zpl_layers:
-                            module.stage_delta_async(None)
-                        for _, module in self._zpl_layers:
-                            module.apply_staged_delta()
+                # ── Record step ──
+                step_ms = (time.perf_counter() - step_start) * 1000
+                self._record_step(self._gather_metrics(loss.item() * self.config.grad_accum_steps, step_ms, gate_skipped))
 
-                    # Launch single background thread to compress all layers
-                    if self._zpl_layers is not None:
-                        if self._zstd_thread is not None:
-                            self._zstd_thread.join()
+                # ── Eval ──
+                if (self._global_step + 1) % self.config.eval_interval == 0:
+                    self._run_eval()
 
-                        def compress_all():
-                            for _, module in self._zpl_layers:
-                                module._compress_async()
-                        self._zstd_thread = threading.Thread(target=compress_all, daemon=True)
-                        self._zstd_thread.start()
+                # ── Checkpoint ──
+                if (self._global_step + 1) % self.config.checkpoint_interval == 0:
+                    self._save_checkpoint()
 
-            # ── Record step ──
-            step_ms = (time.perf_counter() - step_start) * 1000
-            self._record_step(self._gather_metrics(loss.item() * self.config.grad_accum_steps, step_ms, gate_skipped))
+                self._global_step += 1
 
-            # ── Eval ──
-            if (self._global_step + 1) % self.config.eval_interval == 0:
-                self._run_eval()
+        except KeyboardInterrupt:
+            self._log("Interrupted — cleaning up...")
+        finally:
+            self._run_eval()
+            self._save_summary()
+            self._metrics_file.close()
 
-            # ── Checkpoint ──
-            if (self._global_step + 1) % self.config.checkpoint_interval == 0:
-                self._save_checkpoint()
-
-            self._global_step += 1
-
-        # Final eval
-        self._run_eval()
-        self._save_summary()
-        self._metrics_file.close()
-
-        elapsed = time.perf_counter() - self._start_time
-        self._log(f"Training complete in {elapsed:.1f}s.  Results: {self.output_dir}")
+            elapsed = time.perf_counter() - self._start_time
+            self._log(f"Training ({self._global_step} steps) in {elapsed:.1f}s.  Output: {self.output_dir}")
         return self._ephemeral
 
     # ── Metrics ──
