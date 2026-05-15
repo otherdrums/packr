@@ -193,10 +193,8 @@ class DiagnosticTrainer(ZPackRTrainer):
             log["layers"][short_name] = layer_info
 
             all_ratios.extend(ratios)
-            salient_mask = module.block_mask
-            for i in range(len(ratios)):
-                if salient_mask[i]:
-                    all_kept_ratios.append(ratios[i])
+            # All rows active — no block_mask in v5
+            all_kept_ratios.extend(ratios)
 
         if all_ratios:
             log["weight_ratio_max"] = max(all_ratios)

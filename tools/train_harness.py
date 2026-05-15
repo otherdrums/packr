@@ -422,11 +422,11 @@ class ZPackRTrainer:
             total_salient_kb = 0
             total_capacity_kb = 0
             for short_name, module in self._zpl_layers:
-                kept = module.salient_count
-                total = module.num_blocks
+                kept = module.in_features  # row-level: all rows active
+                total = module.in_features
                 salience[short_name] = {"kept": kept, "total": total, "fraction": round(kept / max(total, 1), 3)}
-                total_salient_kb += kept * module.block_size * module.out_features * 2 / 1024
-                total_capacity_kb += total * module.block_size * module.out_features * 2 / 1024
+                total_salient_kb += kept * module.out_features * 2 / 1024
+                total_capacity_kb += total * module.out_features * 2 / 1024
             if salience:
                 metrics["salience"] = salience
                 metrics["salient_vram_kb"] = round(total_salient_kb, 0)
