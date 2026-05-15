@@ -149,59 +149,48 @@ class DiagnosticTrainer(ZPackRTrainer):
     # ── Ratio logging ──
 
     def _log_ratios(self, loss: float, gate_skipped: bool):
-        """Extract and log per-block compression ratios from all ZPackRLinear layers."""
+        """Log per-layer summary stats every step, full per-row data at evals."""
         if self._zpl_layers is None:
             return
 
+        step = self._global_step + 1
         log = {
-            "step": self._global_step + 1,
+            "step": step,
             "loss": loss,
             "gate_skipped": gate_skipped,
             "layers": {},
         }
 
-        all_ratios = []
-        all_kept_ratios = []
-
+        # Per-layer summary stats — fast, no per-row data
         for short_name, module in self._zpl_layers:
-            data = module.get_block_ratios()
-            ratios = data["ratios"]
-
-            layer_info = {
-                "ratio_max": max(ratios),
-                "ratio_min": min(ratios),
-                "ratio_mean": sum(ratios) / len(ratios),
-                "salient_count": data["salient_count"],
-                "num_blocks": data["num_blocks"],
+            attn = module._atten_byte.float()
+            log["layers"][short_name] = {
+                "attn_min": (attn.min().item() / 255.0) if attn.numel() > 0 else 0.0,
+                "attn_mean": (attn.mean().item() / 255.0) if attn.numel() > 0 else 0.0,
+                "attn_max": (attn.max().item() / 255.0) if attn.numel() > 0 else 0.0,
             }
 
-            gaps = data.get("block_gaps", ratios)
-            attenuations = data.get("attenuation_scores")
-            if attenuations is None:
-                attenuations = [0.0] * len(ratios)
+        # Full per-row data only at eval intervals (expensive with 46080 rows)
+        if self._global_step > 0 and step % self.config.eval_interval == 0:
+            for short_name, module in self._zpl_layers:
+                data = module.get_block_ratios()
+                ratios = data["ratios"]
+                attenuations = data.get("attenuation_scores")
+                if attenuations is None:
+                    attenuations = [0.0] * len(ratios)
 
-            layer_info["blocks"] = [
-                {
-                    "blk": i,
-                    "ratio": ratios[i],
-                    "attenuation": attenuations[i] if i < len(attenuations) else 1.0,
-                    "delta_l2": round(data["delta_l2"][i], 8),
-                }
-                for i in range(len(ratios))
-            ]
-
-            log["layers"][short_name] = layer_info
-
-            all_ratios.extend(ratios)
-            # All rows active — no block_mask in v5
-            all_kept_ratios.extend(ratios)
-
-        if all_ratios:
-            log["weight_ratio_max"] = max(all_ratios)
-            log["weight_ratio_min"] = min(all_ratios)
-            log["weight_ratio_mean"] = sum(all_ratios) / len(all_ratios)
-        if all_kept_ratios:
-            log["weight_ratio_kept_mean"] = sum(all_kept_ratios) / len(all_kept_ratios)
+                log["layers"][short_name].update({
+                    "blocks": [
+                        {
+                            "blk": i,
+                            "ratio": ratios[i],
+                            "attenuation": attenuations[i] if i < len(attenuations) else 1.0,
+                            "delta_l2": round(data["delta_l2"][i], 8),
+                        }
+                        for i in range(len(ratios))
+                    ],
+                    "num_blocks": data["num_blocks"],
+                })
 
         self._ratio_file.write(json.dumps(log) + "\n")
         self._ratio_file.flush()
