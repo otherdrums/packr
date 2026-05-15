@@ -439,16 +439,12 @@ class ZPackRTrainer:
             salience = {}
             total_salient_kb = 0
             total_capacity_kb = 0
-            thresholds = {}
             for short_name, module in self._zpl_layers:
                 kept = module.salient_count
                 total = module.num_blocks
                 salience[short_name] = {"kept": kept, "total": total, "fraction": round(kept / max(total, 1), 3)}
                 total_salient_kb += kept * module.block_size * module.out_features * 2 / 1024
                 total_capacity_kb += total * module.block_size * module.out_features * 2 / 1024
-                t = module.salience_threshold
-                if t is not None:
-                    thresholds[short_name] = round(t, 4)
             if salience:
                 metrics["salience"] = salience
                 metrics["salient_vram_kb"] = round(total_salient_kb, 0)
