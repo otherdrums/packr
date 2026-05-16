@@ -181,11 +181,10 @@ class CUDA8BitAdam(torch.optim.Optimizer):
                     _init_state(state, p)
 
                 if p.dtype == torch.bfloat16:
-                    # bf16 kernel path has a 2.25× amplification bug on sm_75
-                    # (Turing).  Workaround: create temporary fp32 copies of
-                    # param+grad, run kernel via the correct fp32 path, copy
-                    # result back.  Temporaries are freed after step() —
-                    # PyTorch's caching allocator reuses the GPU memory.
+                    # sm_75 (Turing) mis-handles the kernel's is_bf16=1 path
+                    # (aliased unsigned short -> float reads).  Workaround:
+                    # create ephemeral fp32 copies, use the correct fp32 path,
+                    # copy result back.  Temporaries freed each step.
                     p_f32 = p.data.float()
                     g_f32 = p.grad.data.float()
                     cuda_mod.launch_adam_8bit(
