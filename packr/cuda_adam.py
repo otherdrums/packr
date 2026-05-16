@@ -84,9 +84,11 @@ static __global__ void adam_8bit_kernel(
     float pn = pv - lr * (mn / bc1) / (sqrtf(vn / bc2) + eps);
 
     if (idx < N) {
-        if (is_bf16)
-            ((unsigned short*)p_raw)[idx] = (unsigned short)(__float_as_uint(pn) >> 16);
-        else
+        if (is_bf16) {
+            unsigned int ui = __float_as_uint(pn);
+            ui += 0x7FFF + ((ui >> 16) & 1);
+            ((unsigned short*)p_raw)[idx] = (unsigned short)(ui >> 16);
+        } else
             ((float*)p_raw)[idx] = pn;
         m[idx] = mi;
         v[idx] = vi;
@@ -180,28 +182,13 @@ class CUDA8BitAdam(torch.optim.Optimizer):
                 if "m" not in state:
                     _init_state(state, p)
 
-                if p.dtype == torch.bfloat16:
-                    # sm_75 (Turing) mis-handles the kernel's is_bf16=1 path
-                    # (aliased unsigned short -> float reads).  Workaround:
-                    # create ephemeral fp32 copies, use the correct fp32 path,
-                    # copy result back.  Temporaries freed each step.
-                    p_f32 = p.data.float()
-                    g_f32 = p.grad.data.float()
-                    cuda_mod.launch_adam_8bit(
-                        p_f32, g_f32,
-                        state["m"], state["v"],
-                        state["m_scale"], state["v_scale"],
-                        0,
-                        lr, b1, b2, eps, bc1, bc2, wd,
-                    )
-                    p.data.copy_(p_f32.to(torch.bfloat16))
-                else:
-                    cuda_mod.launch_adam_8bit(
-                        p, p.grad,
-                        state["m"], state["v"],
-                        state["m_scale"], state["v_scale"],
-                        0,
-                        lr, b1, b2, eps, bc1, bc2, wd,
-                    )
+                is_bf16 = 1 if p.dtype == torch.bfloat16 else 0
+                cuda_mod.launch_adam_8bit(
+                    p, p.grad,
+                    state["m"], state["v"],
+                    state["m_scale"], state["v_scale"],
+                    is_bf16,
+                    lr, b1, b2, eps, bc1, bc2, wd,
+                )
 
         return None

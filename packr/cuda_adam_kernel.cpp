@@ -55,9 +55,14 @@ static __global__ void adam_8bit_kernel(
     float pn = pv - lr * (mn / bc1) / (sqrtf(vn / bc2) + eps);
 
     if (idx < N) {
-        if (is_bf16)
-            ((unsigned short*)p_raw)[idx] = (unsigned short)(__float_as_uint(pn) >> 16);
-        else
+        if (is_bf16) {
+            // Round to nearest (ties to even) — matches PyTorch's BFloat16.
+            // Truncation (>> 16) creates a cumulative negative bias that
+            // amplifies updates on sm_75 (Turing).
+            unsigned int ui = __float_as_uint(pn);
+            ui += 0x7FFF + ((ui >> 16) & 1);
+            ((unsigned short*)p_raw)[idx] = (unsigned short)(ui >> 16);
+        } else
             ((float*)p_raw)[idx] = pn;
         m[idx] = mi;
         v[idx] = vi;
