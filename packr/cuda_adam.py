@@ -152,6 +152,12 @@ class CUDA8BitAdam(torch.optim.Optimizer):
                 if "m" not in state:
                     _init_state(state, p)
 
+                # Ensure bf16 (kernel casts internally via register shift)
+                if p.dtype == torch.float32:
+                    p.data = p.data.to(torch.bfloat16)
+                if p.grad.dtype == torch.float32:
+                    p.grad.data = p.grad.data.to(torch.bfloat16)
+
                 cuda_mod.launch_adam_8bit(
                     p, p.grad,
                     state["m"], state["v"],
