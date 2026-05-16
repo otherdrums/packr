@@ -236,6 +236,8 @@ def main():
                         help="Compute LSH hash every N steps (1 = every step)")
     parser.add_argument("--gradient-mix", type=float, default=0.5,
                         help="Mix between delta and gradient signals (0=delta, 1=gradient)")
+    parser.add_argument("--grad-ema-beta", type=float, default=0.9967,
+                        help="Gradient EMA decay for batch noise cancellation (0.9967 ≈ 300-step window)")
     parser.add_argument("--output-dir", default="runs")
     parser.add_argument("--label", default="", help="Prefix for output directory")
     parser.add_argument("--seed", type=int, default=42)
@@ -245,7 +247,8 @@ def main():
         model_name=args.model,
         task_name=args.task,
         packr_config=PackRConfig(mode="zpackr", bf16=args.bf16, hash_interval=args.hash_interval,
-                                 optimizer_type=args.optimizer, gradient_mix=args.gradient_mix),
+                                 optimizer_type=args.optimizer, gradient_mix=args.gradient_mix,
+                                 grad_ema_beta=args.grad_ema_beta),
         lr=args.lr,
         batch_size=args.batch_size,
         max_steps=args.max_steps,

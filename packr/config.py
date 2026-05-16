@@ -26,6 +26,8 @@ class PackRConfig:
         hash_interval:          Compute LSH hash every N steps (1 = every step)
         gradient_mix:           Mix between delta and gradient signals (0=delta,
                                 1=gradient, 0.5=equal geometric product)
+        grad_ema_beta:          EMA decay for gradient averaging before hashing.
+                                Higher = smoother (0.9967 ≈ 300-step window).
     """
 
     mode: ModeType = "packr"
@@ -40,6 +42,7 @@ class PackRConfig:
     hash_interval: int = 1
     optimizer_type: Literal["triton8", "cuda8", "adamw"] = "triton8"
     gradient_mix: float = 0.5
+    grad_ema_beta: float = 0.9967
 
 
 # Legacy alias
