@@ -69,7 +69,7 @@ def _compress_zpackr(model: nn.Module, config: PackRConfig):
         if not _matches_scope(name, config.layer_scope):
             continue
 
-        zpackr = ZPackRLinear.from_linear(module)
+        zpackr = ZPackRLinear.from_linear(module, hash_interval=config.hash_interval)
         _replace_module(model, name, zpackr)
 
     if config.gradient_checkpointing:

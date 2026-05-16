@@ -23,6 +23,7 @@ class PackRConfig:
         block_size:             Quantization block size for 8-bit optimizer
         bf16:                   Convert model to bfloat16 before training
                                 (saves ~100MB VRAM for BERT-base, no quality loss)
+        hash_interval:          Compute LSH hash every N steps (1 = every step)
     """
 
     mode: ModeType = "packr"
@@ -34,6 +35,8 @@ class PackRConfig:
     offload: bool = False
     block_size: int = 256
     bf16: bool = False
+    hash_interval: int = 1
+    optimizer_type: Literal["triton8", "cuda8", "adamw"] = "triton8"
 
 
 # Legacy alias

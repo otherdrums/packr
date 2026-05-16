@@ -230,6 +230,10 @@ def main():
     parser.add_argument("--attenuation-skip-threshold", type=float, default=ATTENUATION_SKIP_THRESHOLD)
     parser.add_argument("--bf16", action="store_true", default=False,
                         help="Convert model to bfloat16 (saves ~100MB VRAM)")
+    parser.add_argument("--optimizer", choices=["triton8", "cuda8", "adamw"], default="cuda8",
+                        help="Optimizer: cuda8 (fast CUDA 8-bit), triton8 (Triton 8-bit), adamw (standard fp32)")
+    parser.add_argument("--hash-interval", type=int, default=1,
+                        help="Compute LSH hash every N steps (1 = every step)")
     parser.add_argument("--output-dir", default="runs")
     parser.add_argument("--label", default="", help="Prefix for output directory")
     parser.add_argument("--seed", type=int, default=42)
@@ -238,7 +242,7 @@ def main():
     config = TrainerConfig(
         model_name=args.model,
         task_name=args.task,
-        packr_config=PackRConfig(mode="zpackr", bf16=args.bf16),
+        packr_config=PackRConfig(mode="zpackr", bf16=args.bf16, hash_interval=args.hash_interval, optimizer_type=args.optimizer),
         lr=args.lr,
         batch_size=args.batch_size,
         max_steps=args.max_steps,
