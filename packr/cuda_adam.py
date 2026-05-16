@@ -135,9 +135,6 @@ def _init_state(state, p):
     state["v"] = torch.zeros(N, dtype=torch.int8, device=p.device)
     state["m_scale"] = torch.ones(num_blocks, dtype=torch.float32, device=p.device)
     state["v_scale"] = torch.ones(num_blocks, dtype=torch.float32, device=p.device)
-    if p.dtype == torch.bfloat16:
-        state["ws_p"] = torch.empty(N, dtype=torch.float32, device=p.device)
-        state["ws_g"] = torch.empty(N, dtype=torch.float32, device=p.device)
 
 
 class CUDA8BitAdam(torch.optim.Optimizer):
@@ -184,22 +181,21 @@ class CUDA8BitAdam(torch.optim.Optimizer):
                     _init_state(state, p)
 
                 if p.dtype == torch.bfloat16:
-                    # bf16 kernel path has a bug (2× amplification on sm_75).
-                    # Workaround: copy bf16 param/grad into pre-allocated fp32
-                    # workspace, run the (correct) fp32 kernel path, then copy
-                    # the result back to bf16.
-                    ws_p = state["ws_p"]
-                    ws_g = state["ws_g"]
-                    ws_p.copy_(p.data.float().flatten())
-                    ws_g.copy_(p.grad.data.float().flatten())
+                    # bf16 kernel path has a 2.25× amplification bug on sm_75
+                    # (Turing).  Workaround: create temporary fp32 copies of
+                    # param+grad, run kernel via the correct fp32 path, copy
+                    # result back.  Temporaries are freed after step() —
+                    # PyTorch's caching allocator reuses the GPU memory.
+                    p_f32 = p.data.float()
+                    g_f32 = p.grad.data.float()
                     cuda_mod.launch_adam_8bit(
-                        ws_p, ws_g,
+                        p_f32, g_f32,
                         state["m"], state["v"],
                         state["m_scale"], state["v_scale"],
-                        0,  # is_bf16=0 → use correct fp32 path
+                        0,
                         lr, b1, b2, eps, bc1, bc2, wd,
                     )
-                    p.data.copy_(ws_p.reshape(p.shape).to(torch.bfloat16))
+                    p.data.copy_(p_f32.to(torch.bfloat16))
                 else:
                     cuda_mod.launch_adam_8bit(
                         p, p.grad,
