@@ -1,4 +1,8 @@
-"""CUDA 8-bit AdamW — bf16 p/g, int8 m/v, per-param launch, no extra allocations.
+"""CUDA 8-bit AdamW — dtype-agnostic, int8 m/v, per-param launch.
+
+Handles bf16 and fp32 params/grads via an is_bf16 flag.  No dtype
+conversion required — the kernel loads raw bytes and interprets them
+as bf16 or fp32 via inline bit operations.
 
 Compiled inline via load_inline on first import (cached on disk).
 """
@@ -10,19 +14,12 @@ CUDA_SOURCE = r'''
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 
-// bf16 ↔ float conversions (shift left/right by 16)
-__device__ float bf16_to_float(unsigned short v) {
-    return __uint_as_float((unsigned int)v << 16);
-}
-__device__ unsigned short float_to_bf16(float v) {
-    return (unsigned short)(__float_as_uint(v) >> 16);
-}
-
 static __global__ void adam_8bit_kernel(
-    unsigned short* p, const unsigned short* g,
+    void* p_raw, void* g_raw,
     signed char* m, signed char* v,
     float* ms, float* vs,
-    int N, float lr, float b1, float b2, float eps,
+    int N, int is_bf16,
+    float lr, float b1, float b2, float eps,
     float bc1, float bc2, float wd
 ) {
     int bid = blockIdx.x;
@@ -30,8 +27,15 @@ static __global__ void adam_8bit_kernel(
 
     float pv = 0, gv = 0, mf = 0, vf = 0;
     if (idx < N) {
-        pv = bf16_to_float(p[idx]);
-        gv = bf16_to_float(g[idx]);
+        if (is_bf16) {
+            unsigned short pu = ((unsigned short*)p_raw)[idx];
+            unsigned short gu = ((unsigned short*)g_raw)[idx];
+            pv = __uint_as_float((unsigned int)pu << 16);
+            gv = __uint_as_float((unsigned int)gu << 16);
+        } else {
+            pv = ((float*)p_raw)[idx];
+            gv = ((float*)g_raw)[idx];
+        }
         mf = (float)m[idx] * ms[bid];
         vf = (float)v[idx] * vs[bid];
     }
@@ -59,29 +63,38 @@ static __global__ void adam_8bit_kernel(
     signed char vi = (signed char)fminf(fmaxf((vn / nvs + 0.5f), 1.0f), 127.0f);
     float pn = pv - lr * (mn / bc1) / (sqrtf(vn / bc2) + eps);
 
-    if (idx < N) { p[idx] = float_to_bf16(pn); m[idx] = mi; v[idx] = vi; }
+    if (idx < N) {
+        if (is_bf16)
+            ((unsigned short*)p_raw)[idx] = (unsigned short)(__float_as_uint(pn) >> 16);
+        else
+            ((float*)p_raw)[idx] = pn;
+        m[idx] = mi;
+        v[idx] = vi;
+    }
 }
 
 void launch_adam_8bit(
     torch::Tensor p, torch::Tensor g,
     torch::Tensor m, torch::Tensor v,
     torch::Tensor ms, torch::Tensor vs,
+    int is_bf16,
     float lr, float b1, float b2, float eps,
     float bc1, float bc2, float wd
 ) {
-    adam_8bit_kernel<<<(p.numel() + 255) / 256, 256>>>(
-        (unsigned short*)p.data_ptr<at::BFloat16>(),
-        (unsigned short*)g.data_ptr<at::BFloat16>(),
+    int N = p.numel();
+    adam_8bit_kernel<<<(N + 255) / 256, 256>>>(
+        p.data_ptr(), g.data_ptr(),
         (signed char*)m.data_ptr<int8_t>(),
         (signed char*)v.data_ptr<int8_t>(),
         ms.data_ptr<float>(), vs.data_ptr<float>(),
-        p.numel(), lr, b1, b2, eps, bc1, bc2, wd);
+        N, is_bf16,
+        lr, b1, b2, eps, bc1, bc2, wd);
 }
 '''
 
 CPP_SOURCE = r'''
 #include <torch/extension.h>
-void launch_adam_8bit(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, float, float, float, float, float, float, float);
+void launch_adam_8bit(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int, float, float, float, float, float, float, float);
 '''
 
 _cuda_mod = None
@@ -113,6 +126,8 @@ def _init_state(state, p):
 
 class CUDA8BitAdam(torch.optim.Optimizer):
     """8-bit AdamW with per-block int8 quantization.
+
+    Dtype-agnostic: handles bf16 and fp32 params/grads automatically.
 
     Args:
         params:      iterable of parameters
@@ -152,10 +167,12 @@ class CUDA8BitAdam(torch.optim.Optimizer):
                 if "m" not in state:
                     _init_state(state, p)
 
+                is_bf16 = 1 if p.dtype == torch.bfloat16 else 0
                 cuda_mod.launch_adam_8bit(
                     p, p.grad,
                     state["m"], state["v"],
                     state["m_scale"], state["v_scale"],
+                    is_bf16,
                     lr, b1, b2, eps, bc1, bc2, wd,
                 )
 
