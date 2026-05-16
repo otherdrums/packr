@@ -1,13 +1,18 @@
-"""Build precompiled Triton kernel cubins for all target GPU architectures.
+"""Build precompiled kernels for all target GPU architectures.
 
-Run locally when kernel source changes.  Requires triton and torch with CUDA.
-Output: kernels/sm_XX/decode_packed.cubin and kernels/sm_XX/fused_adam_8bit.cubin
+Run locally when kernel source changes.  Requires triton, torch with CUDA,
+and nvcc on PATH.
+
+Output:
+  packr/kernels/sm_XX/*.cubin              Triton AOT cubins
+  packr/_adam_8bit_cuda*.so                CUDA 8-bit AdamW (CUDAExtension)
 
 Eliminates nvcc dependency for PyPI users — kernels are AOT-compiled here
 and shipped as part of the wheel.
 """
 
 import os
+import subprocess
 import sys
 
 
@@ -104,8 +109,35 @@ def build_optimizer_kernel():
         print(f"    sm_{arch}: {cubin_path} ({size} bytes)")
 
 
+def build_cuda_adam_extension():
+    """Build the CUDA 8-bit AdamW .so via setup.py (CUDAExtension).
+
+    If the CUDA version mismatch check fails (system nvcc != torch's CUDA),
+    the kernel falls back to load_inline JIT at import time.
+
+    The Triton AOT cubins above (decode, optimizer) always work regardless.
+    """
+    print("  CUDA 8-bit AdamW extension:")
+    result = subprocess.run(
+        [sys.executable, "setup.py", "build_ext", "--inplace"],
+        cwd=PROJECT_ROOT, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        err = result.stderr[-300:] if result.stderr else result.stdout[-300:]
+        print(f"    setup.py build_ext failed (falls back to JIT): {err[:200]}")
+        return
+
+    # Find the built .so
+    for f in os.listdir(os.path.join(PROJECT_ROOT, "packr")):
+        if f.startswith("_adam_8bit_cuda") and f.endswith(".so"):
+            size = os.path.getsize(os.path.join(PROJECT_ROOT, "packr", f))
+            print(f"    {f} ({size} bytes)")
+            break
+    print("    Done.")
+
+
 def main():
-    print("Building PackR kernels (Triton AOT)...")
+    print("Building PackR kernels (Triton AOT + CUDA)...")
     print(f"  Target arches: {TARGET_ARCHES}")
     print()
 
@@ -117,7 +149,10 @@ def main():
     build_optimizer_kernel()
 
     print()
-    print("  Done.  Commit kernels/ to version control.")
+    build_cuda_adam_extension()
+
+    print()
+    print("  Done.  Commit kernels/ and *.so to version control.")
 
 
 if __name__ == "__main__":

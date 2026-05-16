@@ -1,16 +1,36 @@
 """CUDA 8-bit AdamW — dtype-agnostic, int8 m/v, per-param launch.
 
-Handles bf16 and fp32 params/grads via an is_bf16 flag.  No dtype
-conversion required — the kernel loads raw bytes and interprets them
-as bf16 or fp32 via inline bit operations.
+Handles bf16 and fp32 params/grads via an is_bf16 flag.
 
-Compiled inline via load_inline on first import (cached on disk).
+Two loading paths:
+1. Prebuilt: ``packr._adam_8bit_cuda`` — built by ``setup.py`` (CUDAExtension)
+   at wheel-build time.  No nvcc required at runtime.
+2. JIT fallback: ``torch.utils.cpp_extension.load_inline`` — compiles the
+   embedded CUDA source on first import.  Requires nvcc on PATH.
 """
 
+import logging
 import torch
-from torch.utils.cpp_extension import load_inline
 
-CUDA_SOURCE = r'''
+_cuda_mod = None
+
+def _get_cuda_mod():
+    global _cuda_mod
+    if _cuda_mod is not None:
+        return _cuda_mod
+
+    # 1. Try prebuilt .so (from CUDAExtension in setup.py)
+    try:
+        from packr._adam_8bit_cuda import launch_adam_8bit
+        _cuda_mod = type("CudaMod", (), {"launch_adam_8bit": staticmethod(launch_adam_8bit)})()
+        return _cuda_mod
+    except (ImportError, OSError):
+        pass
+
+    # 2. Fall back to JIT inline compilation (requires nvcc)
+    from torch.utils.cpp_extension import load_inline
+
+    CUDA_SOURCE = r'''
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 
@@ -91,18 +111,11 @@ void launch_adam_8bit(
         lr, b1, b2, eps, bc1, bc2, wd);
 }
 '''
-
-CPP_SOURCE = r'''
+    CPP_SOURCE = r'''
 #include <torch/extension.h>
 void launch_adam_8bit(torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, int, float, float, float, float, float, float, float);
 '''
 
-_cuda_mod = None
-
-def _get_cuda_mod():
-    global _cuda_mod
-    if _cuda_mod is not None:
-        return _cuda_mod
     _cuda_mod = load_inline(
         name='adam_8bit',
         cpp_sources=CPP_SOURCE,
