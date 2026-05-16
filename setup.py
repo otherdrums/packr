@@ -25,7 +25,7 @@ if torch.cuda.is_available():
     try:
         ext = CUDAExtension(
             "packr._adam_8bit_cuda",
-            ["packr/cuda_adam_kernel.cu"],
+            ["packr/cuda_adam_kernel.cpp"],
             extra_cuda_cflags=["--expt-relaxed-constexpr"],
         )
         ext_modules.append(ext)
