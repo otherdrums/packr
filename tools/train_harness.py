@@ -395,6 +395,13 @@ class ZPackRTrainer:
                     loss.backward()
                     self._step_timers['backward'] = time.perf_counter() - t0
 
+                    # Hash gradient (after backward, before optimizer/zero_grad)
+                    t0 = time.perf_counter()
+                    if self._zpl_layers is not None:
+                        for _, module in self._zpl_layers:
+                            module.compute_grad_hash()
+                    self._step_timers['grad_hash'] = time.perf_counter() - t0
+
                     if (self._global_step + 1) % self.config.grad_accum_steps == 0:
                         t0 = time.perf_counter()
                         self._optimizer.step()
@@ -411,7 +418,7 @@ class ZPackRTrainer:
                         self._optimizer.zero_grad()
                         self._step_timers['optimizer'] = time.perf_counter() - t0
 
-                # Compute LSH hash every step (even when gate fires), update window
+                # Compute delta hash + mix with cached gradient signal
                 t0 = time.perf_counter()
                 if self._zpl_layers is not None:
                     for _, module in self._zpl_layers:

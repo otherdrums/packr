@@ -24,6 +24,8 @@ class PackRConfig:
         bf16:                   Convert model to bfloat16 before training
                                 (saves ~100MB VRAM for BERT-base, no quality loss)
         hash_interval:          Compute LSH hash every N steps (1 = every step)
+        gradient_mix:           Mix between delta and gradient signals (0=delta,
+                                1=gradient, 0.5=equal geometric product)
     """
 
     mode: ModeType = "packr"
@@ -37,6 +39,7 @@ class PackRConfig:
     bf16: bool = False
     hash_interval: int = 1
     optimizer_type: Literal["triton8", "cuda8", "adamw"] = "triton8"
+    gradient_mix: float = 0.5
 
 
 # Legacy alias
