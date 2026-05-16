@@ -180,13 +180,26 @@ class CUDA8BitAdam(torch.optim.Optimizer):
                 if "m" not in state:
                     _init_state(state, p)
 
-                is_bf16 = 1 if p.dtype == torch.bfloat16 else 0
-                cuda_mod.launch_adam_8bit(
-                    p, p.grad,
-                    state["m"], state["v"],
-                    state["m_scale"], state["v_scale"],
-                    is_bf16,
-                    lr, b1, b2, eps, bc1, bc2, wd,
-                )
+                if p.dtype == torch.bfloat16:
+                    # bf16 kernel path has a bug (2× amplification).
+                    # Workaround: convert to fp32, run kernel, convert back.
+                    p_f32 = p.data.float()
+                    g_f32 = p.grad.data.float()
+                    cuda_mod.launch_adam_8bit(
+                        p_f32, g_f32,
+                        state["m"], state["v"],
+                        state["m_scale"], state["v_scale"],
+                        0,  # is_bf16=0 → fp32 path
+                        lr, b1, b2, eps, bc1, bc2, wd,
+                    )
+                    p.data.copy_(p_f32.to(torch.bfloat16))
+                else:
+                    cuda_mod.launch_adam_8bit(
+                        p, p.grad,
+                        state["m"], state["v"],
+                        state["m_scale"], state["v_scale"],
+                        0,  # is_bf16=0
+                        lr, b1, b2, eps, bc1, bc2, wd,
+                    )
 
         return None
