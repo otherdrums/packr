@@ -16,8 +16,8 @@ pip install packr
 
 - **3 bytes/weight** storage (uint8 indices + bf16 residual + 256-entry LUT)
 - **CUDA8BitAdam** — 8-bit AdamW via hand-tuned CUDA kernel (default).
-  ~38ms/step for 110M params, dtype-agnostic (bf16/fp32), warp-level reductions.
-  Prebuilt `.so` shipped in wheel — no runtime nvcc dependency.
+  dtype-agnostic (bf16/fp32), warp-level reductions, 8× faster than Triton
+  8-bit fallback.  Prebuilt `.so` shipped in wheel — no runtime nvcc dependency.
 - **FusedQuantizedAdam** — 8-bit AdamW via Triton (fallback), 2 bytes/param
 - **Fused CUDA decode kernel** — no persistent full-precision weight matrix
 - **CPU/system RAM offloading** — stream frozen indices and optimizer states

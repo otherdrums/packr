@@ -101,14 +101,12 @@ def _matches_scope(name: str, scope: str) -> bool:
 
 def _is_ffn(name: str) -> bool:
     """Check if a layer is part of a feed-forward network."""
-    ffn_intermediate = ["intermediate", "fc1", "mlp.up", "ffn.up", "dense_h_to_4h"]
-    ffn_output = ["output.dense", "fc2", "mlp.down", "ffn.down", "dense_4h_to_h"]
+    ffn_intermediate = ["intermediate", "fc1", "mlp.up", "ffn.up", "dense_h_to_4h", "ffn.lin1"]
+    ffn_output = ["output.dense", "fc2", "mlp.down", "ffn.down", "dense_4h_to_h", "ffn.lin2"]
 
     name_lower = name.lower()
-    # FFN intermediate (e.g. encoder.layer.X.intermediate.dense)
     if any(m in name_lower for m in ffn_intermediate):
         return True
-    # FFN output (e.g. encoder.layer.X.output.dense) — NOT attention output
     if any(m in name_lower for m in ffn_output):
         if "attention" not in name_lower:
             return True
@@ -117,7 +115,8 @@ def _is_ffn(name: str) -> bool:
 
 def _is_attention(name: str) -> bool:
     """Check if a layer name corresponds to attention projection."""
-    attn_markers = ["query", "key", "value", "q_proj", "k_proj", "v_proj", "o_proj", "out_proj"]
+    attn_markers = ["query", "key", "value", "q_proj", "k_proj", "v_proj", "o_proj", "out_proj",
+                    "q_lin", "k_lin", "v_lin", "out_lin"]
     name_lower = name.lower()
     return any(m in name_lower for m in attn_markers)
 
