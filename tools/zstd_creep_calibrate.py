@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from packr.config import PackRConfig
 from packr.layer_patcher import compress_model
 from packr.optim import FusedQuantizedAdam
-from packr.zpackr_layer import ZPackRLinear
+from packr.linear_delta import PackRLinearDelta
 
 torch.manual_seed(42)
 device = torch.device("cuda")
@@ -23,7 +23,7 @@ config = PackRConfig(mode="zpackr", layer_scope="ffn")
 model = compress_model(model, config)
 model = model.to(device)
 
-zpl_layers = [(n.replace("bert.encoder.", "enc."), m) for n, m in model.named_modules() if isinstance(m, ZPackRLinear)]
+zpl_layers = [(n.replace("bert.encoder.", "enc."), m) for n, m in model.named_modules() if isinstance(m, PackRLinearDelta)]
 print(f"  Layers: {len(zpl_layers)}")
 
 dataset = load_dataset("glue", "sst2", split="train")

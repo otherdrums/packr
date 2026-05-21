@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from packr.config import PackRConfig
 from packr.layer_patcher import compress_model
 from packr.optim import FusedQuantizedAdam
-from packr.zpackr_layer import ZPackRLinear
+from packr.linear_delta import PackRLinearDelta
 
 # ── Setup ──
 torch.manual_seed(42)
@@ -38,13 +38,13 @@ config = PackRConfig(mode="zpackr", layer_scope="ffn")
 model = compress_model(model, config)
 model = model.to(device)
 
-# Cache ZPackRLinear layers
+# Cache PackRLinearDelta layers
 zpl_layers = [
     (name.replace("bert.encoder.", "enc."), m)
     for name, m in model.named_modules()
-    if isinstance(m, ZPackRLinear)
+    if isinstance(m, PackRLinearDelta)
 ]
-print(f"  ZPackRLinear layers: {len(zpl_layers)}")
+print(f"  PackRLinearDelta layers: {len(zpl_layers)}")
 
 # Load one batch from SST-2
 print("Loading SST-2 batch...")

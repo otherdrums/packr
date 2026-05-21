@@ -27,7 +27,7 @@ import torch
 from tools.train_harness import ZPackRTrainer, TrainerConfig, GLUE_TASKS
 from packr.config import PackRConfig
 from packr.prompt_gate import should_skip_backward
-from packr.zpackr_layer import ZPackRLinear, ATTENUATION_SKIP_THRESHOLD
+from packr.linear_delta import PackRLinearDelta, ATTENUATION_SKIP_THRESHOLD
 
 
 def _timestamp():

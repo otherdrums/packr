@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from packr.config import PackRConfig
 from packr.layer_patcher import compress_model
 from packr.cuda_adam import CUDA8BitAdam
-from packr.zpackr_layer import ZPackRLinear, LSH_OFFSETS
+from packr.linear_delta import PackRLinearDelta, LSH_OFFSETS
 
 NUM_STEPS = 500
 ATTEN_BINS = 32
@@ -73,13 +73,13 @@ def main():
 
     model = model.to(device)
 
-    # Cache ZPackRLinear layers
+    # Cache PackRLinearDelta layers
     zpl_layers = [
         (name.replace("bert.encoder.", "enc."), m)
         for name, m in model.named_modules()
-        if isinstance(m, ZPackRLinear)
+        if isinstance(m, PackRLinearDelta)
     ]
-    print(f"  {len(zpl_layers)} ZPackRLinear layers")
+    print(f"  {len(zpl_layers)} PackRLinearDelta layers")
 
     optimizer = CUDA8BitAdam(model.parameters(), lr=2e-5)
 

@@ -13,11 +13,13 @@ Usage:
 from .kernel import packr_matmul
 from .autograd import PackRMatmulFunction
 from .layer import PackRLinear
+from .linear_delta import PackRLinearDelta
 from .layer_patcher import compress_model
 from .config import PackRConfig, SchemeType
 from .optim import FusedQuantizedAdam
 from .offload import OffloadManager
 from .velvet import VelvetController
+from .velvet_r import VelvetRController, DeltaSignatureDB
 
 # Legacy aliases for backward compatibility with phr-era code
 PHRConfig = PackRConfig
@@ -29,6 +31,7 @@ CV2LRTController = VelvetController
 __all__ = [
     "PackRConfig",
     "PackRLinear",
+    "PackRLinearDelta",
     "PackRMatmulFunction",
     "packr_matmul",
     "compress_model",
@@ -36,6 +39,8 @@ __all__ = [
     "FusedQuantizedAdam",
     "OffloadManager",
     "VelvetController",
+    "VelvetRController",
+    "DeltaSignatureDB",
     # Legacy
     "PHRConfig",
     "PHRLinear",

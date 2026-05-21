@@ -1,31 +1,31 @@
-"""Layer patcher — replaces nn.Linear layers with PackRLinear or ZPackRLinear."""
+"""Layer patcher — replaces nn.Linear layers with compressed equivalents."""
 
 import torch.nn as nn
 from .layer import PackRLinear
+from .linear_delta import PackRLinearDelta
 from .config import PackRConfig
 from .offload import OffloadManager
 
 
 def compress_model(model: nn.Module, config: PackRConfig = None):
     """
-    Replace nn.Linear layers in a model with PackR or ZPackR compressed equivalents.
+    Replace nn.Linear layers in a model with PackRLinear or PackRLinearDelta.
 
     Returns:
-        model: nn.Module with PackRLinear or ZPackRLinear layers.
+        model: nn.Module with compressed linear layers.
     """
     if config is None:
         config = PackRConfig()
 
     if config.mode == "zpackr":
-        return _compress_zpackr(model, config)
+        return _compress_delta(model, config)
 
     # ── PackR mode (default) ──
-    packr_layers = []  # ordered (name, PackRLinear) for offload sequencing
+    packr_layers = []
 
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
-
         if not _matches_scope(name, config.layer_scope):
             continue
 
@@ -59,20 +59,21 @@ def compress_model(model: nn.Module, config: PackRConfig = None):
     return model
 
 
-def _compress_zpackr(model: nn.Module, config: PackRConfig):
-    """Replace nn.Linear layers with ZPackRLinear (frozen base + LZ4 delta)."""
-    from .zpackr_layer import ZPackRLinear
-
+def _compress_delta(model: nn.Module, config: PackRConfig):
+    """Replace nn.Linear layers with PackRLinearDelta (frozen base + delta + VelvetR)."""
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
         if not _matches_scope(name, config.layer_scope):
             continue
 
-        zpackr = ZPackRLinear.from_linear(module, hash_interval=config.hash_interval,
-                                          gradient_mix=config.gradient_mix,
-                                          grad_ema_beta=config.grad_ema_beta)
-        _replace_module(model, name, zpackr)
+        delta_lin = PackRLinearDelta.from_linear(
+            module,
+            hash_interval=config.hash_interval,
+            gradient_mix=config.gradient_mix,
+            grad_ema_beta=config.grad_ema_beta,
+        )
+        _replace_module(model, name, delta_lin)
 
     if config.gradient_checkpointing:
         _enable_gradient_checkpointing(model)

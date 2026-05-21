@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from packr.config import PackRConfig
 from packr.layer_patcher import compress_model
 from packr.cuda_adam import CUDA8BitAdam
-from packr.zpackr_layer import ZPackRLinear
+from packr.linear_delta import PackRLinearDelta
 
 
 def main():
@@ -121,16 +121,16 @@ def main():
         model = model.to(torch.bfloat16)
         model = model.to(device)
 
-        # Collect ZPackRLinear layers
+        # Collect PackRLinearDelta layers
         zpl_layers = [
             (n, m) for n, m in model.named_modules()
-            if isinstance(m, ZPackRLinear)
+            if isinstance(m, PackRLinearDelta)
         ]
 
         # Set fixed attenuation for ALL rows
         fixed_byte = int(max_atten * 255)
         for _, module in zpl_layers:
-            module._atten_byte.fill_(fixed_byte)
+            module.velvet_r._atten_byte.fill_(fixed_byte)
         print(f"atten_byte={fixed_byte}")
 
         # Optimizer

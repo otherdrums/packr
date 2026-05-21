@@ -21,7 +21,7 @@ sys.path.insert(0, "/home/otherdrums/packr")
 from packr.config import PackRConfig
 from packr.layer_patcher import compress_model
 from packr.optim import FusedQuantizedAdam
-from packr.zpackr_layer import ZPackRLinear
+from packr.linear_delta import PackRLinearDelta
 
 torch.manual_seed(42)
 device = torch.device("cuda")
@@ -38,7 +38,7 @@ model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", 
 config = PackRConfig(mode="zpackr", layer_scope="ffn")
 model = compress_model(model, config).to(device)
 
-layers = [(n.replace("bert.encoder.", "enc."), m) for n, m in model.named_modules() if isinstance(m, ZPackRLinear)]
+layers = [(n.replace("bert.encoder.", "enc."), m) for n, m in model.named_modules() if isinstance(m, PackRLinearDelta)]
 print(f"  {len(layers)} layers")
 
 dataset = load_dataset("glue", "sst2", split="train")

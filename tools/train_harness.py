@@ -39,7 +39,7 @@ from packr.layer_patcher import compress_model
 from packr.optim import FusedQuantizedAdam
 from packr.velvet import VelvetController
 from packr.prompt_gate import should_skip_backward
-from packr.zpackr_layer import ZPackRLinear, ATTENUATION_SKIP_THRESHOLD
+from packr.linear_delta import PackRLinearDelta, ATTENUATION_SKIP_THRESHOLD
 
 
 def _git_commit_short():
@@ -175,7 +175,7 @@ class ZPackRTrainer:
         self._ephemeral = {}  # per-run metrics accumulator
         self._gate_skipped_total = 0
         self._gate_total = 0
-        self._zpl_layers = None  # cached list of ZPackRLinear instances
+        self._delta_layers = None  # cached list of PackRLinearDelta instances
         self._peak_vram = 0      # max VRAM seen during run
         self._last_eval_time = None  # for throughput display
         self._metrics_buffer = [] # batched flush every N steps
@@ -217,7 +217,7 @@ class ZPackRTrainer:
             self.config.model_name, num_labels=self.config.num_labels,
         )
 
-        # Compress first (FFN → ZPackRLinear, base_W already bf16)
+        # Compress first (FFN → PackRLinearDelta, base_W already bf16)
         self._log(f"Compressing model (mode={self.config.packr_config.mode}) ...")
         self._model = compress_model(self._model, self.config.packr_config)
 
@@ -242,14 +242,14 @@ class ZPackRTrainer:
 
         self._model = self._model.to(self.device)
 
-        # Cache ZPackRLinear layers to avoid walking named_modules every step
+        # Cache PackRLinearDelta layers to avoid walking named_modules every step
         if self.config.packr_config.mode == "zpackr":
-            self._zpl_layers = [
+            self._delta_layers = [
                 (name.replace("bert.encoder.", "enc."), m)
                 for name, m in self._model.named_modules()
-                if isinstance(m, ZPackRLinear)
+                if isinstance(m, PackRLinearDelta)
             ]
-            self._log(f"  {len(self._zpl_layers)} ZPackRLinear layers with per-layer LSH")
+            self._log(f"  {len(self._delta_layers)} PackRLinearDelta layers with per-layer LSH")
 
         # Dataset
         from datasets import load_dataset
@@ -381,9 +381,9 @@ class ZPackRTrainer:
                 # ── Convergence gate: skip backward if all blocks fully attenuated ──
                 t0 = time.perf_counter()
                 gate_skipped = False
-                if self.config.attenuation_skip_enabled and self._zpl_layers is not None:
+                if self.config.attenuation_skip_enabled and self._delta_layers is not None:
                     gate_skipped = should_skip_backward(
-                        self._zpl_layers, self.config.attenuation_skip_threshold
+                        self._delta_layers, self.config.attenuation_skip_threshold
                     )
                     if gate_skipped:
                         self._gate_skipped_total += 1
@@ -397,8 +397,8 @@ class ZPackRTrainer:
 
                     # Hash gradient (after backward, before optimizer/zero_grad)
                     t0 = time.perf_counter()
-                    if self._zpl_layers is not None:
-                        for _, module in self._zpl_layers:
+                    if self._delta_layers is not None:
+                        for _, module in self._delta_layers:
                             module.compute_grad_hash()
                     self._step_timers['grad_hash'] = time.perf_counter() - t0
 
@@ -420,9 +420,9 @@ class ZPackRTrainer:
 
                 # Compute delta hash + mix with cached gradient signal
                 t0 = time.perf_counter()
-                if self._zpl_layers is not None:
-                    for _, module in self._zpl_layers:
-                        module.compute_hash_gpu()
+                if self._delta_layers is not None:
+                    for _, module in self._delta_layers:
+                        module.compute_delta_hash()
                 self._step_timers['hash'] = time.perf_counter() - t0
 
                 # ── Record step ──
@@ -474,11 +474,11 @@ class ZPackRTrainer:
                 pass
 
         # ZPackR salience + weight ratios
-        if self._zpl_layers is not None:
+        if self._delta_layers is not None:
             salience = {}
             total_salient_kb = 0
             total_capacity_kb = 0
-            for short_name, module in self._zpl_layers:
+            for short_name, module in self._delta_layers:
                 kept = module.in_features  # row-level: all rows active
                 total = module.in_features
                 salience[short_name] = {"kept": kept, "total": total, "fraction": round(kept / max(total, 1), 3)}
@@ -584,10 +584,9 @@ class ZPackRTrainer:
         step_dir = os.path.join(self.checkpoint_dir, f"step_{self._global_step + 1}")
         os.makedirs(step_dir, exist_ok=True)
 
-        # ZPackR layer checkpoints
+        # PackRLinearDelta layer checkpoints (via export_merged)
         if self.config.packr_config.mode == "zpackr":
-            from zpackr.checkpoint import save_zpackr_checkpoint
-            save_zpackr_checkpoint(self._model, step_dir)
+            pass  # checkpoint absorbed into trainer_state below
 
         # Optimizer + Velvet state
         state = {
