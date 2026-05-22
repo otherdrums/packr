@@ -36,6 +36,8 @@ def main():
     parser.add_argument("--eval-steps", type=int, default=50, help="Batches per eval")
     parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--task", type=str, default="sst2",
+                        help="GLUE task name: sst2 (default) or rte")
     parser.add_argument("--prefill", type=str, default=None,
                         help="Path to row_novelty.pt for LSH window prefill")
     args = parser.parse_args()
@@ -66,22 +68,29 @@ def main():
     needs_type_ids = model_type in ("bert", "bertweet", "camembert", "roberta")
     num_labels = model_cfg.num_labels if hasattr(model_cfg, "num_labels") else 2
 
-    raw = load_dataset("glue", "sst2")
+    raw = load_dataset("glue", args.task)
     cols = [c for c in raw["train"].column_names if c != "label"]
+
+    # Tokenization: SST-2 uses single sentence, RTE uses sentence pair
+    if args.task == "rte":
+        def _tokenize(batch):
+            return tokenizer(batch["sentence1"], batch["sentence2"],
+                             truncation=True, padding="max_length", max_length=128)
+        num_labels = 2
+    else:  # sst2 (default)
+        def _tokenize(batch):
+            return tokenizer(batch["sentence"],
+                             truncation=True, padding="max_length", max_length=128)
+        num_labels = 2
+
     torch_cols = ["input_ids", "attention_mask", "label"]
     if needs_type_ids:
         torch_cols = ["input_ids", "attention_mask", "token_type_ids", "label"]
-    train = raw["train"].map(
-        lambda x: tokenizer(x["sentence"], truncation=True, padding="max_length", max_length=128),
-        batched=True, remove_columns=cols,
-    )
+    train = raw["train"].map(_tokenize, batched=True, remove_columns=cols)
     train.set_format("torch", columns=torch_cols)
     loader = torch.utils.data.DataLoader(train, batch_size=16, shuffle=True, drop_last=True)
 
-    eval_ds = raw["validation"].map(
-        lambda x: tokenizer(x["sentence"], truncation=True, padding="max_length", max_length=128),
-        batched=True, remove_columns=cols,
-    )
+    eval_ds = raw["validation"].map(_tokenize, batched=True, remove_columns=cols)
     eval_ds.set_format("torch", columns=torch_cols)
     eval_loader = torch.utils.data.DataLoader(eval_ds, batch_size=32, shuffle=False)
 

@@ -139,6 +139,15 @@ class DeltaSignatureDB:
         self._cursor = (self._cursor + 1) % self._window_size
         self._count = min(self._count + 1, self._window_size)
 
+    @staticmethod
+    def _popcount(x: torch.Tensor) -> torch.Tensor:
+        """Popcount per uint8 element."""
+        x = x.to(torch.int16)
+        x = (x & 0x55) + ((x >> 1) & 0x55)
+        x = (x & 0x33) + ((x >> 2) & 0x33)
+        x = (x & 0x0F) + ((x >> 4) & 0x0F)
+        return x.to(torch.uint8)
+
     def compute_attenuation(self, current_hashes: torch.Tensor) -> torch.Tensor:
         count = self._count
         indices, wl = [], []
@@ -150,12 +159,14 @@ class DeltaSignatureDB:
         if len(indices) == 0:
             return torch.zeros(self.num_rows, device='cuda')
         stored_slices = [self._window_cpu[i].cuda(non_blocking=True) for i in indices]
-        stored = torch.stack(stored_slices).float()
-        current = current_hashes.unsqueeze(0).float()
-        diff = (current - stored).abs()
-        byte_sim = 1.0 - diff / 255.0
-        matching = byte_sim.mean(dim=2)
-        cos_sim = 2 * matching - 1
+        stored = torch.stack(stored_slices).to(torch.uint8)
+        current = current_hashes.unsqueeze(0).to(torch.uint8)
+
+        # Hamming distance via popcount of XOR (all 16 bits weighted equally)
+        xor = current ^ stored
+        diff_bits = self._popcount(xor).float()  # [n_off, num_rows, 2] — 0..8 per byte
+        matching = 1.0 - diff_bits / 8.0          # [0,1] per byte
+        cos_sim = 2 * matching.mean(dim=2) - 1
         weights_t = torch.tensor(wl, device='cuda', dtype=torch.float32)
         attenuation = (cos_sim * weights_t.unsqueeze(1)).sum(dim=0) / weights_t.sum()
         return torch.clamp(attenuation, 0.0, 1.0)
@@ -235,11 +246,16 @@ class VelvetRController:
 
     @torch.no_grad()
     def prefill(self, target_similarity: torch.Tensor):
-        """Pre-fill both LSH windows with synthetic hashes."""
+        """Pre-fill both LSH windows with synthetic hashes.
+
+        Seeds the sliding windows so the first hash comparison produces
+        similarities matching target_similarity.  Does NOT modify _atten_byte
+        — the caller controls attenuation via the ablation clamp or normal
+        training flow.
+        """
         self._sig_db.prefill(target_similarity)
         self._grad_sig_db.prefill(target_similarity)
         self._hash_counter = 0
-        self._atten_byte.copy_((target_similarity * 255).to(dtype=torch.uint8))
 
     def get_attenuation(self) -> torch.Tensor:
         return self._atten_byte.float() / 255.0
