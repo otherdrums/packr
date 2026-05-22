@@ -102,10 +102,18 @@ def _matches_scope(name: str, scope: str) -> bool:
 
 def _is_ffn(name: str) -> bool:
     """Check if a layer is part of a feed-forward network."""
+    name_lower = name.lower()
+
+    # ALBERT: standalone .ffn intermediate, .ffn_output output
+    if name_lower.endswith(".ffn") and not name_lower.endswith(".ffn_output"):
+        return True
+    if name_lower.endswith(".ffn_output"):
+        if "attention" not in name_lower:
+            return True
+
     ffn_intermediate = ["intermediate", "fc1", "mlp.up", "ffn.up", "dense_h_to_4h", "ffn.lin1"]
     ffn_output = ["output.dense", "fc2", "mlp.down", "ffn.down", "dense_4h_to_h", "ffn.lin2"]
 
-    name_lower = name.lower()
     if any(m in name_lower for m in ffn_intermediate):
         return True
     if any(m in name_lower for m in ffn_output):
@@ -116,9 +124,11 @@ def _is_ffn(name: str) -> bool:
 
 def _is_attention(name: str) -> bool:
     """Check if a layer name corresponds to attention projection."""
+    name_lower = name.lower()
+    if ".attention." in name_lower:
+        return True
     attn_markers = ["query", "key", "value", "q_proj", "k_proj", "v_proj", "o_proj", "out_proj",
                     "q_lin", "k_lin", "v_lin", "out_lin"]
-    name_lower = name.lower()
     return any(m in name_lower for m in attn_markers)
 
 
