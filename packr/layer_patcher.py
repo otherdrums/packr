@@ -126,5 +126,5 @@ def _enable_gradient_checkpointing(model: nn.Module):
     """Enable gradient checkpointing on the backbone, if supported."""
     try:
         model.gradient_checkpointing_enable()
-    except AttributeError:
+    except (AttributeError, ValueError, RuntimeError):
         pass
