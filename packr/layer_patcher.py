@@ -1,78 +1,22 @@
-"""Layer patcher — replaces nn.Linear layers with compressed equivalents."""
+"""Layer patcher — replaces nn.Linear layers with PackRLinearDelta."""
 
 import torch.nn as nn
-from .layer import PackRLinear
 from .linear_delta import PackRLinearDelta
 from .config import PackRConfig
-from .offload import OffloadManager
 
 
 def compress_model(model: nn.Module, config: PackRConfig = None):
-    """
-    Replace nn.Linear layers in a model with PackRLinear or PackRLinearDelta.
-
-    Returns:
-        model: nn.Module with compressed linear layers.
-    """
+    """Replace nn.Linear layers with PackRLinearDelta (frozen base + delta)."""
     if config is None:
         config = PackRConfig()
 
-    if config.mode == "zpackr":
-        return _compress_delta(model, config)
-
-    # ── PackR mode (default) ──
-    packr_layers = []
-
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             continue
         if not _matches_scope(name, config.layer_scope):
             continue
 
-        packr = PackRLinear.from_linear(module)
-        packr.lut.requires_grad_(config.learnable_lut)
-
-        parent = model
-        parts = name.split(".")
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        setattr(parent, parts[-1], packr)
-
-        packr_layers.append((name, packr))
-
-    if config.gradient_checkpointing:
-        _enable_gradient_checkpointing(model)
-
-    if config.offload and packr_layers:
-        if next(model.parameters()).is_cpu:
-            model.cuda()
-
-        mgr = OffloadManager(prefetch_depth=1)
-        layer_names = []
-        for name, packr in packr_layers:
-            mgr.register_wp(name, packr.W_p)
-            packr.attach_offload(mgr, name)
-            layer_names.append(name)
-        mgr.set_layer_sequence(layer_names)
-        model._offload_manager = mgr
-
-    return model
-
-
-def _compress_delta(model: nn.Module, config: PackRConfig):
-    """Replace nn.Linear layers with PackRLinearDelta (frozen base + delta + VelvetR)."""
-    for name, module in list(model.named_modules()):
-        if not isinstance(module, nn.Linear):
-            continue
-        if not _matches_scope(name, config.layer_scope):
-            continue
-
-        delta_lin = PackRLinearDelta.from_linear(
-            module,
-            hash_interval=config.hash_interval,
-            gradient_mix=config.gradient_mix,
-            grad_ema_beta=config.grad_ema_beta,
-        )
+        delta_lin = PackRLinearDelta.from_linear(module)
         _replace_module(model, name, delta_lin)
 
     if config.gradient_checkpointing:

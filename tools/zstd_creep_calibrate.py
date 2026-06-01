@@ -19,7 +19,7 @@ from datasets import load_dataset
 print("Loading model...")
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2)
-config = PackRConfig(mode="zpackr", layer_scope="ffn")
+config = PackRConfig(layer_scope="ffn")
 model = compress_model(model, config)
 model = model.to(device)
 

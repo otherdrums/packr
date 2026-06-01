@@ -1,19 +1,18 @@
-"""ZPackR Training Harness — drop-in trainer for GLUE tasks with full instrumentation.
+"""PackR Training Harness — drop-in trainer for GLUE tasks with full instrumentation.
 
-Records per-step metrics (loss, super ratio, salience, weight ratios, VRAM,
-Velvet multipliers, gate stats) to JSON Lines for analysis and ablation.
+Records per-step metrics (loss, VRAM, gate stats) to JSON Lines for analysis
+and ablation.
 
 Usage:
-    from tools.train_harness import ZPackRTrainer, TrainerConfig
+    from tools.train_harness import Trainer, TrainerConfig
 
     config = TrainerConfig(
         model_name="bert-base-uncased",
         task_name="sst2",
-        packr_config=PackRConfig(mode="zpackr"),
         max_steps=2000,
-        output_dir="runs/sst2_zpackr",
+        output_dir="runs/sst2",
     )
-    trainer = ZPackRTrainer(config)
+    trainer = Trainer(config)
     results = trainer.run()
 """
 
@@ -37,9 +36,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from packr.config import PackRConfig
 from packr.layer_patcher import compress_model
 from packr.optim import FusedQuantizedAdam
-from packr.velvet import VelvetController
-from packr.prompt_gate import should_skip_backward
-from packr.linear_delta import PackRLinearDelta, ATTENUATION_SKIP_THRESHOLD
+from packr.linear_delta import PackRLinearDelta
 
 
 def _git_commit_short():
@@ -105,25 +102,7 @@ class TrainerConfig:
     max_steps: int = 10000
     grad_accum_steps: int = 1
     max_seq_length: int = 128
-
-    # Velvet
-    velvet_enabled: bool = True
-    velvet_beta: float = 0.97
-    velvet_min_multiplier: float = 0.175
-    velvet_max_multiplier: float = 1.0
-    velvet_velocity_scale: float = 10.0
     warmup_steps: int = 0
-
-    # Gate (convergence-driven: skip backward when all blocks fully attenuated)
-    attenuation_skip_enabled: bool = True
-    attenuation_skip_threshold: float = ATTENUATION_SKIP_THRESHOLD
-
-    # ZPackR
-    post_step_interval: int = 4
-
-    # ZPackR
-    attenuation_skip_enabled: bool = True
-    attenuation_skip_threshold: float = ATTENUATION_SKIP_THRESHOLD
 
     # Evaluation
     eval_interval: int = 500
@@ -144,12 +123,11 @@ class TrainerConfig:
 
 # ── Trainer ──
 
-class ZPackRTrainer:
-    """Drop-in trainer for GLUE tasks with full ZPackR instrumentation.
+class Trainer:
+    """Drop-in trainer for GLUE tasks with full instrumentation.
 
     Records per-step metrics to metrics.jsonl in the output directory.
-    Supports both packr and zpackr modes, Velvet, prompt gating,
-    checkpointing, and structured ablation runs.
+    Supports checkpointing and structured ablation runs.
     """
 
     def __init__(self, config: TrainerConfig):
@@ -166,15 +144,12 @@ class ZPackRTrainer:
         self._start_time = None
         self._model = None
         self._optimizer = None
-        self._velvet = None
         self._tokenizer = None
         self._train_loader = None
         self._eval_dataset = None
         self._metric = None
         self._scaler = None  # for amp
         self._ephemeral = {}  # per-run metrics accumulator
-        self._gate_skipped_total = 0
-        self._gate_total = 0
         self._delta_layers = None  # cached list of PackRLinearDelta instances
         self._peak_vram = 0      # max VRAM seen during run
         self._last_eval_time = None  # for throughput display
@@ -217,18 +192,15 @@ class ZPackRTrainer:
             self.config.model_name, num_labels=self.config.num_labels,
         )
 
-        # Compress first (FFN → PackRLinearDelta, base_W already bf16)
-        self._log(f"Compressing model (mode={self.config.packr_config.mode}) ...")
+        # Compress (FFN → PackRLinearDelta)
+        self._log("Compressing model ...")
         self._model = compress_model(self._model, self.config.packr_config)
 
         # Optional bf16 conversion (saves ~60MB VRAM).
-        # LayerNorm forward is patched to cast input/weight/bias to fp32
-        # internally — F.layer_norm in this PyTorch version requires
-        # matching dtypes.
         if self.config.packr_config.bf16:
             import torch.nn.functional as F
             self._model = self._model.to(torch.bfloat16)
-            if not getattr(nn.LayerNorm, '_zpackr_bf16_patched', False):
+            if not getattr(nn.LayerNorm, '_bf16_patched', False):
                 _orig_ln = nn.LayerNorm.forward
                 def _bf16_ln(self, input):
                     if input.dtype == torch.bfloat16:
@@ -237,19 +209,18 @@ class ZPackRTrainer:
                         return F.layer_norm(input.float(), self.normalized_shape, w, b, self.eps).bfloat16()
                     return _orig_ln(self, input)
                 nn.LayerNorm.forward = _bf16_ln
-                nn.LayerNorm._zpackr_bf16_patched = True
+                nn.LayerNorm._bf16_patched = True
             self._log(f"  Converted model to bfloat16")
 
         self._model = self._model.to(self.device)
 
         # Cache PackRLinearDelta layers to avoid walking named_modules every step
-        if self.config.packr_config.mode == "zpackr":
-            self._delta_layers = [
-                (name.replace("bert.encoder.", "enc."), m)
-                for name, m in self._model.named_modules()
-                if isinstance(m, PackRLinearDelta)
-            ]
-            self._log(f"  {len(self._delta_layers)} PackRLinearDelta layers with per-layer LSH")
+        self._delta_layers = [
+            (name.replace("bert.encoder.", "enc."), m)
+            for name, m in self._model.named_modules()
+            if isinstance(m, PackRLinearDelta)
+        ]
+        self._log(f"  {len(self._delta_layers)} PackRLinearDelta layers")
 
         # Dataset
         from datasets import load_dataset
@@ -310,16 +281,6 @@ class ZPackRTrainer:
                 flat_buffer=True,
             )
 
-        # Velvet
-        if self.config.velvet_enabled:
-            self._velvet = VelvetController(
-                self._optimizer,
-                beta=self.config.velvet_beta,
-                min_multiplier=self.config.velvet_min_multiplier,
-                max_multiplier=self.config.velvet_max_multiplier,
-                velocity_scale=self.config.velvet_velocity_scale,
-            )
-
         # Metric
         import evaluate
         self._metric = evaluate.load("glue", self.config.task_name)
@@ -378,56 +339,19 @@ class ZPackRTrainer:
                 loss = outputs.loss / self.config.grad_accum_steps
                 self._step_timers['forward'] = time.perf_counter() - t0
 
-                # ── Convergence gate: skip backward if all blocks fully attenuated ──
                 t0 = time.perf_counter()
-                gate_skipped = False
-                if self.config.attenuation_skip_enabled and self._delta_layers is not None:
-                    gate_skipped = should_skip_backward(
-                        self._delta_layers, self.config.attenuation_skip_threshold
-                    )
-                    if gate_skipped:
-                        self._gate_skipped_total += 1
-                    self._gate_total += 1
-                self._step_timers['gate'] = time.perf_counter() - t0
+                loss.backward()
+                self._step_timers['backward'] = time.perf_counter() - t0
 
-                if not gate_skipped:
+                if (self._global_step + 1) % self.config.grad_accum_steps == 0:
                     t0 = time.perf_counter()
-                    loss.backward()
-                    self._step_timers['backward'] = time.perf_counter() - t0
-
-                    # Hash gradient (after backward, before optimizer/zero_grad)
-                    t0 = time.perf_counter()
-                    if self._delta_layers is not None:
-                        for _, module in self._delta_layers:
-                            module.compute_grad_hash()
-                    self._step_timers['grad_hash'] = time.perf_counter() - t0
-
-                    if (self._global_step + 1) % self.config.grad_accum_steps == 0:
-                        t0 = time.perf_counter()
-                        self._optimizer.step()
-
-                        # Warmup
-                        if self.config.warmup_steps > 0 and self._velvet is not None:
-                            if self._global_step < self.config.warmup_steps:
-                                self._velvet.warmup_step(self._global_step, self.config.warmup_steps)
-
-                        # Velvet
-                        if self._velvet is not None:
-                            self._velvet.step()
-
-                        self._optimizer.zero_grad()
-                        self._step_timers['optimizer'] = time.perf_counter() - t0
-
-                # Compute delta hash + mix with cached gradient signal
-                t0 = time.perf_counter()
-                if self._delta_layers is not None:
-                    for _, module in self._delta_layers:
-                        module.compute_delta_hash()
-                self._step_timers['hash'] = time.perf_counter() - t0
+                    self._optimizer.step()
+                    self._optimizer.zero_grad()
+                    self._step_timers['optimizer'] = time.perf_counter() - t0
 
                 # ── Record step ──
                 step_ms = (time.perf_counter() - step_start) * 1000
-                self._record_step(self._gather_metrics(loss.item() * self.config.grad_accum_steps, step_ms, gate_skipped))
+                self._record_step(self._gather_metrics(loss.item() * self.config.grad_accum_steps, step_ms))
 
                 # ── Eval ──
                 if (self._global_step + 1) % self.config.eval_interval == 0:
@@ -452,34 +376,20 @@ class ZPackRTrainer:
 
     # ── Metrics ──
 
-    def _gather_metrics(self, loss: float, step_ms: float, gate_skipped: bool) -> dict:
+    def _gather_metrics(self, loss: float, step_ms: float) -> dict:
         metrics = {
             "step": self._global_step + 1,
             "loss": loss,
             "step_ms": step_ms,
-            "gate_skipped": gate_skipped,
         }
 
-        # Velvet multipliers
-        if self._velvet is not None:
-            try:
-                stats = self._velvet.get_stats()
-                multipliers = {}
-                for gname, ginfo in stats.get("per_group", {}).items():
-                    multipliers[gname] = round(ginfo.get("multiplier", 1.0), 4)
-                metrics["velvet_multipliers"] = multipliers
-                metrics["velvet_max_mult"] = max(multipliers.values()) if multipliers else 0
-                metrics["velvet_min_mult"] = min(multipliers.values()) if multipliers else 0
-            except Exception:
-                pass
-
-        # ZPackR salience + weight ratios
+        # Salience + weight ratios
         if self._delta_layers is not None:
             salience = {}
             total_salient_kb = 0
             total_capacity_kb = 0
             for short_name, module in self._delta_layers:
-                kept = module.in_features  # row-level: all rows active
+                kept = module.in_features
                 total = module.in_features
                 salience[short_name] = {"kept": kept, "total": total, "fraction": round(kept / max(total, 1), 3)}
                 total_salient_kb += kept * module.out_features * 2 / 1024
@@ -584,17 +494,10 @@ class ZPackRTrainer:
         step_dir = os.path.join(self.checkpoint_dir, f"step_{self._global_step + 1}")
         os.makedirs(step_dir, exist_ok=True)
 
-        # PackRLinearDelta layer checkpoints (via export_merged)
-        if self.config.packr_config.mode == "zpackr":
-            pass  # checkpoint absorbed into trainer_state below
-
-        # Optimizer + Velvet state
         state = {
             "step": self._global_step + 1,
             "optimizer": self._optimizer.state_dict(),
         }
-        if self._velvet is not None:
-            state["velvet_stats"] = self._velvet.get_stats()
         torch.save(state, os.path.join(step_dir, "trainer_state.pt"))
 
         self._record_event("checkpoint", {"path": step_dir})
@@ -607,9 +510,6 @@ class ZPackRTrainer:
             "elapsed_seconds": time.perf_counter() - self._start_time,
             "final_eval_metric": self._ephemeral.get("eval_metric"),
             "peak_vram_mb": self._peak_vram,
-            "gate_skipped": self._gate_skipped_total,
-            "gate_total": self._gate_total,
-            "gate_skip_rate": round(self._gate_skipped_total / max(self._gate_total, 1), 3),
             "output_dir": self.output_dir,
             "config": asdict(self.config),
         }
@@ -626,27 +526,19 @@ class ZPackRTrainer:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="ZPackR Training Harness")
+    parser = argparse.ArgumentParser(description="PackR Training Harness")
     parser.add_argument("--model", default="bert-base-uncased")
     parser.add_argument("--task", default="sst2")
-    parser.add_argument("--mode", default="zpackr", choices=["packr", "zpackr"])
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-steps", type=int, default=2000)
     parser.add_argument("--eval-interval", type=int, default=500)
     parser.add_argument("--eval-steps", type=int, default=20)
     parser.add_argument("--warmup-steps", type=int, default=0)
-    parser.add_argument("--velvet", action="store_true", default=True)
-    parser.add_argument("--no-velvet", action="store_false", dest="velvet")
-    parser.add_argument("--attenuation-skip", action="store_true", default=True)
-    parser.add_argument("--no-attenuation-skip", action="store_false", dest="attenuation_skip")
-    parser.add_argument("--attenuation-skip-threshold", type=float, default=ATTENUATION_SKIP_THRESHOLD)
     parser.add_argument("--bf16", action="store_true", default=False,
                         help="Convert model to bfloat16 (saves ~100MB VRAM)")
     parser.add_argument("--optimizer", choices=["triton8", "cuda8", "adamw"], default="cuda8",
                         help="Optimizer: cuda8 (fast CUDA 8-bit), triton8 (Triton 8-bit), adamw (standard fp32)")
-    parser.add_argument("--hash-interval", type=int, default=1,
-                        help="Compute LSH hash every N steps (1 = every step)")
     parser.add_argument("--output-dir", default="runs")
     parser.add_argument("--label", default="")
     parser.add_argument("--seed", type=int, default=42)
@@ -655,21 +547,18 @@ def main():
     config = TrainerConfig(
         model_name=args.model,
         task_name=args.task,
-        packr_config=PackRConfig(mode=args.mode, bf16=args.bf16, hash_interval=args.hash_interval, optimizer_type=args.optimizer),
+        packr_config=PackRConfig(bf16=args.bf16, optimizer_type=args.optimizer),
         lr=args.lr,
         batch_size=args.batch_size,
         max_steps=args.max_steps,
         eval_interval=args.eval_interval,
         eval_steps=args.eval_steps,
         warmup_steps=args.warmup_steps,
-        velvet_enabled=args.velvet,
-        attenuation_skip_enabled=args.attenuation_skip,
-        attenuation_skip_threshold=args.attenuation_skip_threshold,
         output_dir=args.output_dir,
         run_label=args.label,
         seed=args.seed,
     )
-    trainer = ZPackRTrainer(config)
+    trainer = Trainer(config)
     trainer.run()
 
 

@@ -25,7 +25,7 @@ class TestPackROffload:
             pytest.skip("CUDA required")
 
         config = PackRConfig(layer_scope="all", offload=True,
-                             gradient_checkpointing=False, learnable_lut=True)
+                             gradient_checkpointing=False)
         model = torch.nn.Sequential(torch.nn.Linear(64, 32, bias=False))
         model = compress_model(model, config)
         model = model.cuda()
@@ -65,7 +65,7 @@ class TestPackROffload:
             pytest.skip("CUDA required")
 
         config = PackRConfig(layer_scope="all", offload=True,
-                             gradient_checkpointing=False, learnable_lut=True)
+                             gradient_checkpointing=False)
         model = torch.nn.Sequential(torch.nn.Linear(128, 64, bias=False))
         model = compress_model(model, config)
         model = model.cuda()

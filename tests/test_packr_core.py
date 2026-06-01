@@ -67,8 +67,7 @@ class TestPackRForward:
 
 class TestPackRBackward:
     def test_gradient_flow(self, device):
-        config = PackRConfig(layer_scope="all", gradient_checkpointing=False,
-                             learnable_lut=True)
+        config = PackRConfig(layer_scope="all", gradient_checkpointing=False)
         model = torch.nn.Sequential(torch.nn.Linear(64, 32, bias=False))
         model = compress_model(model, config)
         model = model.to(device)
@@ -83,8 +82,7 @@ class TestPackRBackward:
                 assert not torch.isnan(p.grad).any(), f"{name} grad has NaN"
 
     def test_lut_gradient_exists(self, device):
-        config = PackRConfig(layer_scope="all", gradient_checkpointing=False,
-                             learnable_lut=True)
+        config = PackRConfig(layer_scope="all", gradient_checkpointing=False)
         model = torch.nn.Sequential(torch.nn.Linear(64, 32, bias=False))
         model = compress_model(model, config)
         model = model.to(device)
@@ -93,16 +91,15 @@ class TestPackRBackward:
         loss = out.sum()
         loss.backward()
 
-        # lut should receive gradient
-        lut_grad = model[0].lut.grad
-        assert lut_grad is not None
-        assert lut_grad.shape == (256,)
-        assert not torch.isnan(lut_grad).any()
+        # delta should receive gradient
+        delta = model[0].delta
+        assert delta.grad is not None
+        assert delta.grad.shape == (64, 32)
+        assert not torch.isnan(delta.grad).any()
 
     def test_gradient_consistency(self, device):
         """Verify that two forward+backward passes produce non-identical gradients."""
-        config = PackRConfig(layer_scope="all", gradient_checkpointing=False,
-                             learnable_lut=True)
+        config = PackRConfig(layer_scope="all", gradient_checkpointing=False)
         model = torch.nn.Sequential(torch.nn.Linear(64, 32, bias=False))
         model = compress_model(model, config)
         model = model.to(device)
@@ -110,16 +107,16 @@ class TestPackRBackward:
         x1 = torch.randn(8, 64, device=device)
         out1 = model(x1)
         out1.sum().backward()
-        grad1 = model[0].lut.grad.clone()
+        grad1 = model[0].delta.grad.clone()
 
         model.zero_grad()
         x2 = torch.randn(8, 64, device=device)
         out2 = model(x2)
         out2.sum().backward()
-        grad2 = model[0].lut.grad.clone()
+        grad2 = model[0].delta.grad.clone()
 
-        # Different inputs should produce different LUT gradients
-        assert not torch.allclose(grad1, grad2), "Different inputs produced identical LUT gradients"
+        # Different inputs should produce different delta gradients
+        assert not torch.allclose(grad1, grad2), "Different inputs produced identical delta gradients"
 
     @_needs_cuda
     def test_gradient_flow_cuda(self):
@@ -141,8 +138,7 @@ class TestPackRMultiLayer:
         assert out.shape == (8, 16)
 
     def test_two_layer_backward(self, device):
-        config = PackRConfig(layer_scope="all", gradient_checkpointing=False,
-                             learnable_lut=True)
+        config = PackRConfig(layer_scope="all", gradient_checkpointing=False)
         model = torch.nn.Sequential(
             torch.nn.Linear(64, 32, bias=False),
             torch.nn.Linear(32, 16, bias=False),

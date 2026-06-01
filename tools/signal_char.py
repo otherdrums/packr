@@ -35,7 +35,7 @@ hf_logging.set_verbosity_error()
 print("Loading...")
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2)
-config = PackRConfig(mode="zpackr", layer_scope="ffn")
+config = PackRConfig(layer_scope="ffn")
 model = compress_model(model, config).to(device)
 
 layers = [(n.replace("bert.encoder.", "enc."), m) for n, m in model.named_modules() if isinstance(m, PackRLinearDelta)]

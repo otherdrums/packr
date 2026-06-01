@@ -1,172 +1,40 @@
-# PackR — Compressed neural network weights with learnable codebooks
+# PackR — Packed Residual for memory-efficient neural network training
 
 > **Warning — Early development.**  PackR is under active development and not
 > yet ready for production use.  APIs and training dynamics are subject to
 > change without notice.  Expect breakage, improvement, and iteration.
 
-Drop-in `nn.Linear` replacement that stores weights as uint8 bytecode indices
-into a trainable 256-entry lookup table plus bfloat16 residual deltas —
-3 bytes/weight, 37% less GPU memory with accuracy matching or exceeding full fine-tune.
-
-```bash
-pip install packr
-```
+Drop-in `nn.Linear` replacement that stores weights as a frozen base matrix plus
+a trainable bfloat16 delta — memory-efficient fine-tuning with accuracy matching
+or exceeding full fine-tune.
 
 ## Features
 
-- **3 bytes/weight** storage (uint8 indices + bf16 residual + 256-entry LUT)
+- **Frozen base + trainable delta** — stores a full-precision base (frozen) and
+  a bfloat16 delta (trainable), reducing VRAM by ~37% vs standard fp32.
 - **CUDA8BitAdam** — 8-bit AdamW via hand-tuned CUDA kernel (default).
-  dtype-agnostic (bf16/fp32), warp-level reductions, 8× faster than Triton
+  Dtype-agnostic (bf16/fp32), warp-level reductions, 8× faster than Triton
   8-bit fallback.  Prebuilt `.so` shipped in wheel — no runtime nvcc dependency.
-- **FusedQuantizedAdam** — 8-bit AdamW via Triton (fallback), 2 bytes/param
-- **Fused CUDA decode kernel** — no persistent full-precision weight matrix
-- **CPU/system RAM offloading** — stream frozen indices and optimizer states
-  from pinned RAM to GPU on demand
-- **Velvet adaptive scheduler** — closed-loop per-layer LR control; reads `exp_avg_sq`
-  velocity every optimizer step, EMA-filters out micro-batch noise, dynamically
-  throttles saturated layers while keeping hungry layers at full learning rate
 - **Drop-in replacement** — `compress_model(model)` converts any HuggingFace model
-- **Dual mode** — `mode="packr"` (LUT codebook) or `mode="zpackr"` (frozen base + delta + VelvetR)
-- **VelvetR** — per-row LSH dual-signal attenuation controller.  Tracks delta position
-  stability and gradient direction consistency over a sliding 4200-step window.
-  Rows that converge get quiesced automatically; rows still learning stay hot.
-  Pre-fillable from token frequency analysis for zero-warmup startup.
-
-## How It Works
-
-PackR decomposes a weight matrix into three components:
-
-- **W_p** (uint8, 1 byte/weight, frozen): Byte indices into a 256-entry codebook
-- **W_f** (bfloat16, 2 bytes/weight, trainable): Floating-point residual
-- **lut** (float32, 256 entries, trainable): Learnable codebook
-
-Forward pass: `out = x @ (W_f + lut[W_p]) + bias`
-
-| Representation | Persistent VRAM per weight |
-|---------------|:-------------------------:|
-| Standard fp32 | 4 bytes |
-| Standard fp16 | 2 bytes |
-| PackR | 3 bytes |
 
 ## Quick Start
 
 ```python
 from transformers import AutoModelForSequenceClassification
-from packr import compress_model, PackRConfig, FusedQuantizedAdam, VelvetController
+from packr import compress_model, PackRConfig
 
-# Compress FFN layers
-config = PackRConfig(scheme="phr", learnable_lut=True, offload=False)
+config = PackRConfig(layer_scope="ffn")
 model = AutoModelForSequenceClassification.from_pretrained("bert-base-uncased", num_labels=2)
 model = compress_model(model, config)
-model.cuda()
 
-# 8-bit AdamW optimizer (full beta1=0.9 momentum, 6 bytes/param saved)
-optimizer = FusedQuantizedAdam(model.parameters(), lr=2e-5, betas=(0.9, 0.999))
+optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
 
-# Velvet: adaptive per-layer LR from gradient velocity (optional, experimental)
-velvet = VelvetController(optimizer, train_samples=42190)  # auto-tunes all knobs
-
-# Standard PyTorch training loop — no changes
 for batch in loader:
     loss = model(**batch).loss
     loss.backward()
     optimizer.step()
-    velvet.step()     # reads exp_avg_sq velocity, adjusts LRs
     optimizer.zero_grad()
 ```
-
-## Offloading
-
-Stream frozen `W_p` indices and optimizer states from pinned system RAM:
-
-```python
-config = PackRConfig(offload=True)
-model = compress_model(model, config)
-# Training loop unchanged — offloading is transparent
-```
-
-### How It Works
-
-Three mechanisms coordinate transparently:
-
-- **W_p streaming** — A small GPU buffer pool reuses tensors for the current
-  layer's forward pass.  Pinned CPU memory holds canonical uint8 indices.
-  Synchronous default-stream copies avoid races with cuBLAS.
-
-- **Chunked optimizer state streaming** — m/v/scales are stored as pinned CPU
-  tensors grouped into ~100 MB chunks.  During `step()`, each chunk's states
-  are copied to GPU via non-blocking transfers, used by the Triton kernel,
-  then evicted via double-buffered offload-stream DMA overlapping with the
-  next chunk's compute.
-
-- **Automatic wiring** — `compress_model()` creates the OffloadManager and
-  attaches it to every PackRLinear layer and the optimizer.  The training
-  loop needs zero changes — offloading is invisible at the Python level.
-
-## Velvet — Adaptive Per-Layer Learning Rates  (highly experimental)
-
-> Velvet's auto-tuning behavior is under active research.  The `beta`,
-> `velocity_scale`, `min_multiplier`, and `v_ref_beta` parameters are currently
-> derived from a single `train_samples` value using a heuristic scale factor.
-> This mapping is unstable across dataset sizes and may produce suboptimal
-> results on micro-datasets (< 5K examples).  Expect the auto-tuning formula
-> and defaults to evolve rapidly.  Use `verbose=True` and monitor the per-group
-> multiplier stats during training.
-
-Velvet (Velocity to Learning Rate Translation) aims to replace hand-tuned LR schedules
-with real-time closed-loop adaptation.  Every optimizer step, it reads each
-layer's `exp_avg_sq` (the AdamW second-moment buffer), computes the filtered
-velocity of gradient variance, and translates that velocity to a per-layer LR
-multiplier.
-
-### How It Works
-
-1. **Read**: After `optimizer.step()`, Velvet reads `exp_avg_sq` for every
-   parameter.  Int8 block-quantized states (FusedQuantizedAdam) are
-   dequantized automatically.
-
-2. **Velocity**: `Δv = v_mean_current − v_mean_previous` captures whether the
-   layer's gradients are still climbing (active learning) or have flattened
-   (saturation).
-
-3. **EMA filter**: Raw step-to-step velocity is noisy (SGD is stochastic).
-   An exponential moving average with β=0.97 (half-life ~23 steps) separates
-   signal from micro-batch jitter.
-
-4. **Normalize**: Divide by current `v_mean` to get the relative rate of
-   change — comparable across layers with different weight magnitudes.
-
-5. **Translate**: `multiplier = clamp(min, max, |EMA_vel| / v_mean × scale)`.
-   High velocity → layer is hungry → multiplier stays at 1.0 (full LR).
-   Velocity → 0 → layer is saturated → multiplier decays to `min_multiplier`.
-
-### Usage
-
-```python
-from packr import VelvetController
-
-velvet = VelvetController(optimizer, beta=0.97, min_multiplier=0.175)
-
-# In training loop:
-for step, batch in enumerate(loader):
-    loss = model(**batch).loss
-    loss.backward()
-    if step < warmup_steps:
-        velvet.warmup_step(step, warmup_steps)
-    optimizer.step()
-    velvet.step()
-    optimizer.zero_grad()
-```
-
-### Parameters
-
-| Parameter | Default | Role |
-|-----------|:------:|------|
-| `train_samples` | None | Dataset size — if set, auto-tunes beta, velocity_scale, min_multiplier, and v_ref_beta from a single scale factor. |
-| `beta` | None (auto) | EMA smoothing for velocity (None = auto from train_samples) |
-| `min_multiplier` | None (auto) | LR floor when velocity flatlines (None = auto from train_samples) |
-| `max_multiplier` | 1.0 | LR ceiling when actively learning |
-| `velocity_scale` | None (auto) | Sensitivity of velocity → multiplier mapping (None = auto from train_samples) |
 
 ## Requirements
 
