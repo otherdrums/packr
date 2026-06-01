@@ -92,7 +92,9 @@ class TrainerConfig:
     num_labels: Optional[int] = None
 
     # PackR
+    packr_enabled: bool = True
     packr_config: PackRConfig = field(default_factory=PackRConfig)
+    offload_enabled: bool = False
 
     # Optimization
     lr: float = 2e-5
@@ -192,9 +194,12 @@ class Trainer:
             self.config.model_name, num_labels=self.config.num_labels,
         )
 
-        # Compress (FFN → PackRLinearDelta)
-        self._log("Compressing model ...")
-        self._model = compress_model(self._model, self.config.packr_config)
+        # Compress (FFN → PackRLinearDelta) unless baseline mode
+        if self.config.packr_enabled:
+            self._log("Compressing model ...")
+            self._model = compress_model(self._model, self.config.packr_config)
+        else:
+            self._log("Baseline mode — skipping PackR compression")
 
         # Optional bf16 conversion (saves ~60MB VRAM).
         if self.config.packr_config.bf16:
@@ -214,13 +219,16 @@ class Trainer:
 
         self._model = self._model.to(self.device)
 
-        # Cache PackRLinearDelta layers to avoid walking named_modules every step
-        self._delta_layers = [
-            (name.replace("bert.encoder.", "enc."), m)
-            for name, m in self._model.named_modules()
-            if isinstance(m, PackRLinearDelta)
-        ]
-        self._log(f"  {len(self._delta_layers)} PackRLinearDelta layers")
+        # Cache PackRLinearDelta layers (only relevant when compression is active)
+        if self.config.packr_enabled:
+            self._delta_layers = [
+                (name.replace("bert.encoder.", "enc."), m)
+                for name, m in self._model.named_modules()
+                if isinstance(m, PackRLinearDelta)
+            ]
+            self._log(f"  {len(self._delta_layers)} PackRLinearDelta layers")
+        else:
+            self._delta_layers = None
 
         # Dataset
         from datasets import load_dataset
@@ -280,6 +288,13 @@ class Trainer:
                 block_size=self.config.packr_config.block_size,
                 flat_buffer=True,
             )
+
+        # Wire up optimizer offload (CPU streaming of optimizer states)
+        if self.config.offload_enabled:
+            from packr.offload import OffloadManager
+            mgr = OffloadManager()
+            self._optimizer.enable_offload(mgr)
+            self._log("  Optimizer offload enabled")
 
         # Metric
         import evaluate
@@ -541,12 +556,18 @@ def main():
                         help="Optimizer: cuda8 (fast CUDA 8-bit), triton8 (Triton 8-bit), adamw (standard fp32)")
     parser.add_argument("--output-dir", default="runs")
     parser.add_argument("--label", default="")
+    parser.add_argument("--no-packr", action="store_false", dest="packr_enabled", default=True,
+                        help="Disable PackR compression (baseline mode)")
+    parser.add_argument("--offload", action="store_true", default=False,
+                        help="Enable CPU offload of optimizer states (requires triton8)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     config = TrainerConfig(
         model_name=args.model,
         task_name=args.task,
+        packr_enabled=args.packr_enabled,
+        offload_enabled=args.offload,
         packr_config=PackRConfig(bf16=args.bf16, optimizer_type=args.optimizer),
         lr=args.lr,
         batch_size=args.batch_size,
